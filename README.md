@@ -41,10 +41,24 @@
 
 ## 快速开始
 
+### 0. 获取代码
+
+```bash
+git clone https://github.com/sanhe458/zen-gate-server.git
+cd zen-gate-server
+```
+
+或从 [Releases](https://github.com/sanhe458/zen-gate-server/releases) 直接下载预编译二进制：
+
+```bash
+# linux/amd64
+curl -L -o zen-gate-server https://github.com/sanhe458/zen-gate-server/releases/latest/download/zen-gate-server-linux-amd64
+chmod +x zen-gate-server && ./zen-gate-server
+```
+
 ### 1. 构建
 
 ```bash
-git clone <this-repo> && cd zen-gate-server
 make build            # → dist/zen-gate-server
 # 或交叉编译 linux/amd64 + linux/arm64：
 make release
