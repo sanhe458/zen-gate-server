@@ -1,0 +1,667 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zen Gate Server · 控制台</title>
+<link rel="icon" href="/favicon.png">
+<style>
+:root{
+  --bg:#0d1117; --bg2:#161b22; --bg3:#1d2430; --line:#2b3442;
+  --tx:#e6edf3; --tx2:#8b949e; --tx3:#65707e;
+  --acc:#4f8ef7; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --purple:#a371f7;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--tx);font:14px/1.6 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;min-height:100vh}
+a{color:var(--acc);text-decoration:none}
+::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:#30363d;border-radius:5px}
+.wrap{max-width:1180px;margin:0 auto;padding:0 20px}
+
+/* top bar */
+header{background:rgba(13,17,23,.92);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:50;backdrop-filter:blur(6px)}
+.hbar{display:flex;align-items:center;gap:14px;height:58px}
+.logo{display:flex;align-items:center;gap:10px;font-weight:700;font-size:16px;white-space:nowrap}
+.logo img{width:26px;height:26px;border-radius:6px}
+.logo .sub{color:var(--tx3);font-weight:400;font-size:12px;margin-left:2px}
+.badge{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:2px 10px;border-radius:20px;border:1px solid var(--line);color:var(--tx2);white-space:nowrap}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--tx3);flex:none}
+.dot.live{background:var(--ok);box-shadow:0 0 6px var(--ok)}
+.dot.warn{background:var(--warn)} .dot.bad{background:var(--bad)}
+.spacer{flex:1}
+
+/* tabs */
+nav{display:flex;gap:2px;margin-top:44px}
+nav button{background:none;border:none;color:var(--tx2);font-size:14px;padding:9px 16px;cursor:pointer;border-bottom:2px solid transparent}
+nav button:hover{color:var(--tx)}
+nav button.on{color:var(--tx);border-bottom-color:var(--acc);font-weight:600}
+main{padding:22px 0 60px}
+.page{display:none}.page.on{display:block}
+
+/* cards */
+.grid{display:grid;gap:14px}
+.g4{grid-template-columns:repeat(4,1fr)} .g3{grid-template-columns:repeat(3,1fr)} .g2{grid-template-columns:repeat(2,1fr)}
+@media(max-width:900px){.g4{grid-template-columns:repeat(2,1fr)}.g3{grid-template-columns:1fr}.g2{grid-template-columns:1fr}}
+.card{background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:16px}
+.card h3{font-size:13px;color:var(--tx2);font-weight:500;margin-bottom:8px}
+.stat .v{font-size:26px;font-weight:700;font-family:var(--mono);letter-spacing:-.5px}
+.stat .s{font-size:12px;color:var(--tx3);margin-top:2px}
+.kv{display:flex;justify-content:space-between;padding:7px 0;border-bottom:1px dashed var(--line);font-size:13px;gap:12px}
+.kv:last-child{border-bottom:none}
+.kv b{font-family:var(--mono);font-weight:600;color:var(--tx);word-break:break-all;text-align:right}
+.kv span{color:var(--tx2);flex:none}
+
+/* model cards */
+.mcard{background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:15px 17px;margin-bottom:12px}
+.mtop{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.mname{font-weight:700;font-size:15px}
+.mmono{font-family:var(--mono);font-size:12px;color:var(--tx3)}
+.pill{font-size:11px;padding:1px 8px;border-radius:10px;border:1px solid var(--line);color:var(--tx2)}
+.st{font-size:12px;font-weight:600;padding:2px 10px;border-radius:12px}
+.st.av{color:#7ee787;background:rgba(63,185,80,.12)}
+.st.th{color:#e3b341;background:rgba(210,153,34,.12)}
+.st.rg{color:#ff7b72;background:rgba(248,81,73,.12)}
+.st.uk{color:#8b949e;background:rgba(139,148,158,.12)}
+.st.un{color:#ff7b72;background:rgba(248,81,73,.12)}
+.mbody{display:flex;gap:22px;flex-wrap:wrap;margin-top:10px;font-size:12.5px;color:var(--tx2)}
+.mbody b{color:var(--tx);font-family:var(--mono);font-weight:600}
+.mbody .lab{color:var(--tx3);margin-right:4px}
+.blurb{margin-top:9px;font-size:12.5px;color:var(--tx2);border-left:2px solid var(--line);padding-left:10px}
+.qbar{height:5px;background:var(--bg3);border-radius:3px;margin-top:10px;overflow:hidden}
+.qbar i{display:block;height:100%;background:var(--acc);border-radius:3px;transition:width .4s}
+.qmeta{display:flex;justify-content:space-between;font-size:11px;color:var(--tx3);margin-top:4px;gap:10px}
+button.btn{background:var(--bg3);color:var(--tx);border:1px solid var(--line);border-radius:7px;padding:5px 14px;font-size:12.5px;cursor:pointer}
+button.btn:hover{border-color:var(--acc);color:var(--acc)}
+button.btn.pri{background:var(--acc);border-color:var(--acc);color:#fff}
+button.btn.pri:hover{filter:brightness(1.12);color:#fff}
+button.btn:disabled{opacity:.45;cursor:default}
+.mtop .btn{margin-left:auto}
+
+/* tables */
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th{color:var(--tx3);font-weight:500;text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:7px 10px;border-bottom:1px solid #21262e;vertical-align:top}
+tr:hover td{background:#141a23}
+td.mono,span.mono,code.mono{font-family:var(--mono);font-size:12px}
+code{font-family:var(--mono);font-size:12.3px;background:var(--bg3);padding:1px 6px;border-radius:5px}
+
+/* log */
+#logBox{background:#0a0e14;border:1px solid var(--line);border-radius:10px;padding:12px;font-family:var(--mono);font-size:12px;height:480px;overflow-y:auto}
+.lg{padding:1px 0;word-break:break-all}
+.lg .t{color:var(--tx3)} .lg .lv{font-weight:700}
+.lv.I{color:#7ee787}.lv.W{color:#e3b341}.lv.E{color:#ff7b72}
+
+/* heatmap */
+.heat{display:flex;gap:2px;flex-wrap:wrap}
+.hm{width:11px;height:11px;border-radius:2px;background:#1b2129}
+.hm.l1{background:#0e4429}.hm.l2{background:#006d32}.hm.l3{background:#26a641}.hm.l4{background:#39d353}
+
+/* bars */
+.hbar-row{display:flex;align-items:center;gap:10px;margin-bottom:8px;font-size:12.5px}
+.hbar-row .nm{width:190px;flex:none;color:var(--tx2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hbar-row .tr{flex:1;height:14px;background:var(--bg3);border-radius:4px;overflow:hidden}
+.hbar-row .tr i{display:block;height:100%;background:linear-gradient(90deg,var(--acc),var(--purple))}
+.hbar-row .vv{width:90px;flex:none;text-align:right;font-family:var(--mono);color:var(--tx2)}
+
+/* settings */
+.form{display:grid;grid-template-columns:220px 1fr;gap:12px 16px;align-items:center;margin-top:6px}
+.form label{color:var(--tx2);font-size:13px}
+.form input,.form select{background:var(--bg);border:1px solid var(--line);color:var(--tx);border-radius:7px;padding:7px 11px;font-size:13px;width:100%;max-width:340px}
+.form input:focus,.form select:focus{outline:none;border-color:var(--acc)}
+.form .hint{grid-column:2;font-size:12px;color:var(--tx3);margin-top:-8px}
+.form .full{grid-column:2}
+.savebar{margin-top:18px;display:flex;gap:10px;align-items:center}
+.note{font-size:12.5px;color:var(--warn)}
+.mut{color:var(--tx3);font-size:12px}
+
+/* code blocks */
+pre{background:#0a0e14;border:1px solid var(--line);border-radius:10px;padding:14px 16px;font-family:var(--mono);font-size:12.3px;overflow-x:auto;color:#c9d1d9;margin:8px 0 18px;position:relative;white-space:pre-wrap;word-break:break-all}
+.copy{position:absolute;top:8px;right:8px;background:var(--bg3);border:1px solid var(--line);color:var(--tx2);border-radius:6px;font-size:11px;padding:3px 9px;cursor:pointer}
+.copy:hover{color:var(--acc);border-color:var(--acc)}
+.sec-title{font-size:15px;font-weight:700;margin:26px 0 4px}
+.field{display:flex;gap:8px;align-items:center;margin:8px 0;flex-wrap:wrap}
+.field input{background:var(--bg);border:1px solid var(--line);color:var(--tx);border-radius:7px;padding:7px 11px;font-size:12.5px;font-family:var(--mono);width:340px;max-width:70vw}
+.field input[readonly]{color:var(--tx2)}
+
+/* login overlay */
+#login{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:100}
+#login .box{width:360px;background:var(--bg2);border:1px solid var(--line);border-radius:14px;padding:34px 30px;text-align:center}
+#login img{width:56px;height:56px;border-radius:12px;margin-bottom:12px}
+#login h2{font-size:17px;margin-bottom:4px}
+#login p{color:var(--tx2);font-size:12.5px;margin-bottom:18px}
+#login input{width:100%;background:var(--bg);border:1px solid var(--line);color:var(--tx);border-radius:8px;padding:10px 13px;font-size:14px;margin-bottom:12px;text-align:center}
+#login input:focus{outline:none;border-color:var(--acc)}
+#login .err{color:var(--bad);font-size:12.5px;min-height:18px;margin-bottom:6px}
+#login button{width:100%;padding:10px;font-size:14px}
+
+#toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--bg3);border:1px solid var(--line);color:var(--tx);padding:9px 20px;border-radius:9px;font-size:13px;opacity:0;transition:opacity .25s;pointer-events:none;z-index:99}
+#toast.show{opacity:1}
+.switch{position:relative;width:38px;height:21px;flex:none;cursor:pointer;display:inline-block;vertical-align:middle}
+.switch input{opacity:0;width:0;height:0}
+.switch i{position:absolute;inset:0;background:var(--bg3);border:1px solid var(--line);border-radius:20px;transition:.2s}
+.switch i:before{content:"";position:absolute;width:13px;height:13px;left:3px;top:3px;background:var(--tx2);border-radius:50%;transition:.2s}
+.switch input:checked+i{background:var(--acc);border-color:var(--acc)}
+.switch input:checked+i:before{transform:translateX(17px);background:#fff}
+</style>
+</head>
+<body>
+
+<div id="login" style="display:none">
+  <div class="box">
+    <img src="/favicon.png" alt="">
+    <h2>Zen Gate Server</h2>
+    <p>远程访问需要输入 WebUI 密码</p>
+    <div class="err" id="loginErr"></div>
+    <input type="password" id="loginPw" placeholder="WebUI 密码" autocomplete="current-password">
+    <button class="btn pri" onclick="doLogin()">登 录</button>
+  </div>
+</div>
+
+<header>
+  <div class="wrap hbar">
+    <div class="logo"><img src="/favicon.png" alt="">Zen Gate <span class="sub">SERVER</span></div>
+    <span class="badge" id="liveBadge"><span class="dot"></span>加载中…</span>
+    <span class="badge" id="egBadge">出口检测中…</span>
+    <div class="spacer"></div>
+    <span class="badge mono" id="uptimeBadge" title="运行时长"></span>
+    <span class="badge" id="verBadge"></span>
+  </div>
+</header>
+
+<div class="wrap">
+  <nav id="tabs">
+    <button data-p="home" class="on">总览</button>
+    <button data-p="models">模型</button>
+    <button data-p="stats">统计</button>
+    <button data-p="logs">日志</button>
+    <button data-p="settings">设置</button>
+    <button data-p="connect">接入</button>
+  </nav>
+
+<main>
+<!-- 总览 -->
+<div class="page on" id="p-home">
+  <div class="grid g4">
+    <div class="card stat"><h3>可用模型</h3><div class="v" id="stAvail">–</div><div class="s" id="stAvailSub">共 0 个模型</div></div>
+    <div class="card stat"><h3>今日请求</h3><div class="v" id="stReq">–</div><div class="s" id="stReqSub">失败 0</div></div>
+    <div class="card stat"><h3>今日输出</h3><div class="v" id="stTok">–</div><div class="s">tokens · <span id="stIn">入 0</span></div></div>
+    <div class="card stat"><h3>网关地址</h3><div class="v" style="font-size:17px;word-break:break-all" id="stUrl">–</div><div class="s" id="stUrlSub"></div></div>
+  </div>
+
+  <div class="grid g2" style="margin-top:14px">
+    <div class="card">
+      <h3>服务信息</h3>
+      <div class="kv"><span>监听地址</span><b id="iListen">–</b></div>
+      <div class="kv"><span>出口 IP</span><b id="iEgress">–</b></div>
+      <div class="kv"><span>版本</span><b id="iVer">–</b></div>
+      <div class="kv"><span>启动时间</span><b id="iStart">–</b></div>
+      <div class="kv"><span>数据目录</span><b id="iData">–</b></div>
+      <div class="kv"><span>进程 PID</span><b id="iPid">–</b></div>
+      <div class="kv"><span>代理模式</span><b id="iProxy">–</b></div>
+      <div class="kv"><span>探测周期</span><b id="iProbe">–</b></div>
+    </div>
+    <div class="card">
+      <h3>最近调用 <span class="mut">（最近 40 条）</span></h3>
+      <div style="max-height:330px;overflow-y:auto">
+        <table><thead><tr><th>时间</th><th>模型</th><th>Tokens</th><th>耗时</th><th>结果</th></tr></thead>
+        <tbody id="recentBody"><tr><td colspan="5" class="mut">暂无调用</td></tr></tbody></table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 模型 -->
+<div class="page" id="p-models">
+  <div style="display:flex;gap:10px;align-items:center;margin-bottom:14px">
+    <span class="mut">每 <span id="probeInt">15</span> 分钟自动探测一次</span>
+    <div class="spacer"></div>
+    <button class="btn" onclick="reprobe()" id="reprobeBtn">↻ 重新探测全部</button>
+  </div>
+  <div id="modelList"></div>
+</div>
+
+<!-- 统计 -->
+<div class="page" id="p-stats">
+  <div class="grid g2">
+    <div class="card"><h3>近 30 天请求量</h3><div id="chartReq"></div></div>
+    <div class="card"><h3>近 30 天输出 Tokens</h3><div id="chartTok"></div></div>
+  </div>
+  <div class="card" style="margin-top:14px"><h3>模型用量占比（今日输出 tokens）</h3><div id="modelShare"></div></div>
+  <div class="card" style="margin-top:14px">
+    <div style="display:flex;align-items:center;gap:10px"><h3 style="margin:0">用量热力图（近 17 周）</h3>
+      <div class="spacer"></div><span class="mut" id="heatTotal"></span></div>
+    <div class="heat" id="heatmap" style="margin-top:12px"></div>
+    <div class="mut" style="margin-top:8px;display:flex;gap:6px;align-items:center">
+      少 <span class="hm"></span><span class="hm l1"></span><span class="hm l2"></span><span class="hm l3"></span><span class="hm l4"></span> 多
+    </div>
+  </div>
+  <div style="margin-top:14px"><button class="btn" onclick="location='/admin/api/usage.csv'">⬇ 导出 CSV</button></div>
+</div>
+
+<!-- 日志 -->
+<div class="page" id="p-logs">
+  <div style="display:flex;gap:10px;align-items:center;margin-bottom:12px">
+    <select id="logLevel" style="background:var(--bg);border:1px solid var(--line);color:var(--tx);border-radius:7px;padding:6px 10px">
+      <option value="">全部级别</option><option value="info">INFO+</option><option value="warn">WARN+</option><option value="error">ERROR</option>
+    </select>
+    <label class="switch" title="自动刷新"><input type="checkbox" id="logAuto" checked><i></i></label>
+    <span class="mut">自动刷新</span>
+    <div class="spacer"></div>
+    <span class="mut">内存环形缓冲最近 1000 条 · 文件日志在数据目录 logs/ 下</span>
+    <button class="btn" onclick="loadLogs()">刷新</button>
+  </div>
+  <div id="logBox"></div>
+</div>
+
+<!-- 设置 -->
+<div class="page" id="p-settings">
+  <div class="card" style="max-width:780px">
+    <h3>网关与模型</h3>
+    <div class="form">
+      <label>默认最大输出 tokens</label><input type="number" id="fMaxTok" min="256" step="256">
+      <div class="hint">下游未带 max_tokens 时使用的输出预算</div>
+      <label>默认思考力度</label>
+      <select id="fEffort"><option value="light">light 轻量</option><option value="balanced">balanced 均衡</option><option value="deep">deep 深思</option></select>
+      <div class="hint">客户端可用模型名后缀 (light)/(deep) 或 reasoning_effort 覆盖</div>
+      <label>自动探测间隔（分钟）</label><input type="number" id="fProbeInt" min="1" max="240" style="width:120px">
+      <div class="hint">每轮探测全部模型的可用性与首字延迟</div>
+      <label>限流自动切换</label>
+      <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
+        <label class="switch"><input type="checkbox" id="fFailover"><i></i></label>
+        <input type="number" id="fFailMax" min="1" max="5" style="width:90px" title="最多尝试模型数">
+        <span class="mut">被限流时最多尝试的模型数</span>
+      </div>
+      <label>暴露地区信息</label>
+      <div style="display:flex;gap:10px;align-items:center">
+        <label class="switch"><input type="checkbox" id="fRegion"><i></i></label>
+        <span class="mut">错误信息中附带出口地区，便于排查地区门</span>
+      </div>
+    </div>
+
+    <h3 style="margin-top:26px">代理</h3>
+    <div class="form">
+      <label>代理模式</label>
+      <select id="fProxyMode">
+        <option value="env">跟随环境变量 http_proxy</option>
+        <option value="direct">直连</option>
+        <option value="system">跟随系统代理（桌面环境）</option>
+        <option value="custom">自定义</option>
+      </select>
+      <label>代理地址</label><input id="fProxyUrl" placeholder="http://127.0.0.1:7890" style="font-family:var(--mono)">
+      <div class="full"><button class="btn" onclick="proxyTest()">测试此代理到上游的连通性</button>
+      <span class="mut" id="proxyTestOut" style="margin-left:10px"></span></div>
+    </div>
+
+    <h3 style="margin-top:26px">监听与安全 <span class="mut" style="font-weight:400">（端口/地址改动需重启服务生效）</span></h3>
+    <div class="form">
+      <label>监听端口</label><input type="number" id="fPort" min="1" max="65535" style="width:120px">
+      <label>监听地址</label>
+      <select id="fHost">
+        <option value="">127.0.0.1 — 仅本机</option>
+        <option value="0.0.0.0">0.0.0.0 — 所有网卡（局域网/容器）</option>
+      </select>
+      <div class="hint">绑定 0.0.0.0 后 API 与管理页将暴露给局域网，务必设置 WebUI 密码</div>
+      <label>WebUI 密码</label><input type="password" id="fPass" placeholder="留空 = 不修改" autocomplete="new-password">
+      <div class="hint" id="passHint"></div>
+    </div>
+
+    <h3 style="margin-top:26px">API Key</h3>
+    <div class="field">
+      <span class="mut" style="width:60px">主 Key</span>
+      <input id="fMainKey" readonly style="max-width:460px">
+      <button class="btn" onclick="copyVal(document.getElementById('fMainKey').value)">复制</button>
+      <button class="btn" onclick="rotateKey()">轮换</button>
+    </div>
+    <div class="mut" style="margin:2px 0 0">OpenAI / Anthropic / Responses 三种协议统一使用此 Key（Bearer 或 x-api-key 均可）</div>
+
+    <div class="savebar">
+      <button class="btn pri" onclick="saveSettings()">保存设置</button>
+      <span class="note" id="saveNote"></span>
+    </div>
+  </div>
+
+  <div class="card" style="max-width:780px;margin-top:14px">
+    <h3>配置备份</h3>
+    <div class="savebar" style="margin-top:4px">
+      <button class="btn" onclick="location='/admin/api/export'">导出 config.json</button>
+      <label class="btn" style="display:inline-flex;align-items:center">导入配置<input type="file" id="importFile" accept=".json" style="display:none"></label>
+    </div>
+  </div>
+</div>
+
+<!-- 接入 -->
+<div class="page" id="p-connect">
+  <div class="card">
+    <div class="sec-title" style="margin-top:0">连接信息</div>
+    <div class="field"><span class="mut" style="width:70px">Base URL</span><input id="cBase" readonly><button class="btn" onclick="copyVal(document.getElementById('cBase').value)">复制</button></div>
+    <div class="field"><span class="mut" style="width:70px">API Key</span><input id="cKey" readonly><button class="btn" onclick="copyVal(document.getElementById('cKey').value)">复制</button></div>
+    <div class="mut">三种协议同端口；推理模型支持力度后缀：<code class="mono">模型名 (light)</code> / <code class="mono">模型名 (deep)</code>。</div>
+  </div>
+
+  <div class="sec-title">OpenAI Chat Completions</div>
+  <pre><button class="copy" onclick="copyPre(this)">复制</button><code id="exOpenai"></code></pre>
+
+  <div class="sec-title">Anthropic Messages（Claude 协议）</div>
+  <pre><button class="copy" onclick="copyPre(this)">复制</button><code id="exAnthropic"></code></pre>
+
+  <div class="sec-title">Claude Code 接入</div>
+  <pre><button class="copy" onclick="copyPre(this)">复制</button><code id="exClaude"></code></pre>
+
+  <div class="sec-title">Codex CLI 接入</div>
+  <pre><button class="copy" onclick="copyPre(this)">复制</button><code id="exCodex"></code></pre>
+
+  <div class="sec-title">OpenCode 接入</div>
+  <pre><button class="copy" onclick="copyPre(this)">复制</button><code id="exOpenCode"></code></pre>
+
+  <div class="sec-title">模型速查</div>
+  <div class="card">
+    <table><thead><tr><th>模型 ID</th><th>显示名</th><th>能力</th><th>上下文 / 输出</th><th>状态</th></tr></thead><tbody id="modelRef"></tbody></table>
+  </div>
+</div>
+</main>
+</div>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+let S=null, pollTimer=null;
+
+const $=id=>document.getElementById(id);
+const fmt=n=>(n==null?"0":Number(n).toLocaleString("en-US"));
+const kfmt=n=>n>=1e6?(n/1e6).toFixed(1)+"M":n>=1e3?(n/1e3).toFixed(1)+"K":String(n||0);
+function toast(m){const t=$("toast");t.textContent=m;t.classList.add("show");setTimeout(()=>t.classList.remove("show"),2200)}
+function copyVal(v){if(navigator.clipboard){navigator.clipboard.writeText(v).then(()=>toast("已复制"),()=>{})}}
+function copyPre(btn){copyVal(btn.parentElement.querySelector("code").textContent)}
+function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
+function hm(ms){return ms?ms+" ms":"–"}
+function eta(sec){if(!sec||sec<0)return"恢复中";if(sec<60)return Math.ceil(sec)+" 秒";if(sec<3600)return Math.ceil(sec/60)+" 分钟";return Math.ceil(sec/3600)+" 小时"}
+
+async function api(path,opts){
+  const r=await fetch("/admin/api/"+path,opts||{});
+  if(r.status===401){showLogin();throw new Error("unauthorized")}
+  return r.json();
+}
+
+/* ---------- auth ---------- */
+function showLogin(){$("login").style.display="flex";stopPoll()}
+async function doLogin(){
+  const pw=$("loginPw").value;
+  const r=await fetch("/admin/api/login",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({password:pw})});
+  const j=await r.json();
+  if(j.ok){$("login").style.display="none";$("loginPw").value="";$("loginErr").textContent="";boot()}
+  else $("loginErr").textContent=j.error||"登录失败";
+}
+$("loginPw").addEventListener("keydown",e=>{if(e.key==="Enter")doLogin()});
+
+/* ---------- tabs ---------- */
+document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{
+  document.querySelectorAll("#tabs button").forEach(x=>x.classList.toggle("on",x===b));
+  document.querySelectorAll(".page").forEach(p=>p.classList.toggle("on",p.id==="p-"+b.dataset.p));
+  if(b.dataset.p==="stats")renderStats();
+  if(b.dataset.p==="logs")loadLogs();
+});
+
+/* ---------- boot & polling ---------- */
+async function boot(){
+  try{
+    S=await api("state");
+    applyState();
+    startPoll();
+  }catch(e){}
+}
+function startPoll(){stopPoll();pollTimer=setInterval(refreshState,5000)}
+function stopPoll(){if(pollTimer){clearInterval(pollTimer);pollTimer=null}}
+async function refreshState(){
+  try{S=await api("state");applyState()}catch(e){}
+}
+function todayKey(){
+  const t=new Date();
+  return t.getFullYear()+"-"+String(t.getMonth()+1).padStart(2,"0")+"-"+String(t.getDate()).padStart(2,"0");
+}
+function stateDay(){
+  return (S&&S.stats&&S.stats.days&&S.stats.days[todayKey()])||{requests:0,failed:0,input:0,output:0,models:{}};
+}
+
+function applyState(){
+  if(!S)return;
+  const m=S.models||[];
+  const avail=m.filter(x=>x.state==="available").length;
+  const throttled=m.filter(x=>x.state==="throttled").length;
+  $("stAvail").textContent=avail;
+  $("stAvailSub").textContent="共 "+m.length+" 个模型"+(throttled?" · "+throttled+" 个限额中":"");
+  const today=stateDay();
+  $("stReq").textContent=fmt(today.requests);
+  $("stReqSub").textContent="失败 "+fmt(today.failed||0);
+  $("stTok").textContent=kfmt(today.output);
+  $("stIn").textContent="入 "+kfmt(today.input);
+  $("stUrl").textContent=S.baseURL;
+  $("stUrlSub").textContent="监听 "+S.listenAddr+(S.loopback?" · 仅本机":" · 局域网可达");
+  $("liveBadge").innerHTML='<span class="dot live"></span>运行中 · '+avail+' 模型可用';
+  const eg=S.egress||{};
+  const cntry=eg.country||"–";
+  if(cntry==="CN")$("egBadge").innerHTML='<span class="dot warn"></span>出口 CN — 部分模型可能被地区门拦截';
+  else $("egBadge").textContent="出口 "+(eg.ip||"–")+" · "+cntry;
+  $("uptimeBadge").textContent="已运行 "+(S.uptime||"");
+  $("verBadge").textContent="v"+S.version;
+  $("iListen").textContent=S.listenAddr+(S.loopback?"（仅本机）":"（局域网）");
+  $("iEgress").textContent=(eg.ip||"–")+" · "+cntry;
+  $("iVer").textContent="v"+S.version;
+  $("iStart").textContent=S.startedAt;
+  $("iData").textContent=S.dataDir;
+  $("iPid").textContent=S.pid;
+  $("iProxy").textContent=({env:"环境变量",direct:"直连",system:"系统代理",custom:"自定义"})[S.settings.proxyMode]||S.settings.proxyMode;
+  $("iProbe").textContent="每 "+S.settings.probeIntervalMinutes+" 分钟";
+  $("probeInt").textContent=S.settings.probeIntervalMinutes;
+  renderRecent();
+  fillSettings();
+  renderModels();
+  renderConnect();
+}
+
+function renderRecent(){
+  const rec=(S.stats&&S.stats.recent)||[];
+  const tb=$("recentBody");
+  if(!rec.length){tb.innerHTML='<tr><td colspan="5" class="mut">暂无调用</td></tr>';return}
+  tb.innerHTML=rec.slice().reverse().map(r=>'<tr>'+
+    '<td class="mono">'+new Date(r.at).toLocaleTimeString("zh-CN",{hour12:false})+'</td>'+
+    '<td class="mono">'+esc(r.model||"")+'</td>'+
+    '<td class="mono">'+kfmt(r.output)+'</td>'+
+    '<td class="mono">'+hm(r.latencyMs)+'</td>'+
+    '<td>'+(r.ok?'<span style="color:var(--ok)">✓</span>':'<span style="color:var(--bad)" title="'+esc(r.error||"")+'">✗</span>')+'</td></tr>').join("");
+}
+
+/* ---------- models ---------- */
+const stateCls={available:"av",throttled:"th",region_block:"rg",unknown:"uk",unavailable:"un"};
+const stateTxt={available:"可用",throttled:"已限额",region_block:"地区受限",unknown:"未探测",unavailable:"不可用"};
+function renderModels(){
+  if(!S)return;
+  const m=S.models||[];
+  const list=$("modelList");
+  if(!m.length){list.innerHTML='<div class="card mut">模型目录尚未加载（等待首次探测）…</div>';return}
+  list.innerHTML=m.map(x=>{
+    const st=x.state||"unknown";
+    let quota="";
+    if(!x.systemOne){
+      const pct=x.quotaEstimate?Math.min(100,(x.quotaUsed||0)*100/x.quotaEstimate):0;
+      quota='<div class="qbar"><i style="width:'+pct.toFixed(1)+'%"></i></div>'+
+        '<div class="qmeta"><span>今日 '+kfmt(x.quotaUsed||0)+" tok"+(x.quotaEstimate?" / 估算日额度 ~"+kfmt(x.quotaEstimate):"（额度统计中）")+"</span>"+
+        (x.recoverEta?'<span>预计 '+eta(x.recoverEta)+" 恢复</span>":"")+"</div>";
+    }
+    return '<div class="mcard">'+
+      '<div class="mtop"><span class="mname">'+esc(x.name)+'</span>'+
+      '<span class="mmono">'+esc(x.id)+'</span>'+
+      '<span class="st '+(stateCls[st]||"uk")+'">'+(stateTxt[st]||esc(st))+'</span>'+
+      (x.systemOne?'<span class="pill">System One</span>':"")+
+      (x.vision?'<span class="pill">视觉</span>':"")+
+      (x.reasoning?'<span class="pill">推理</span>':"")+
+      (x.regionSensitive?'<span class="pill" style="color:var(--warn)">地区敏感</span>':"")+
+      '<button class="btn" data-m="'+esc(x.id)+'" onclick="probeOne(this)">测试</button></div>'+
+      '<div class="mbody">'+
+      '<span><span class="lab">首字</span><b>'+hm(x.ttftMs)+'</b></span>'+
+      '<span><span class="lab">平均首字</span><b>'+hm(x.ttftAvgMs)+'</b><span class="mut">('+ (x.ttftCount||0)+" 次)</span></span>"+
+      '<span><span class="lab">上下文</span><b>'+kfmt(x.contextWindow)+'</b></span>'+
+      '<span><span class="lab">最大输出</span><b>'+kfmt(x.maxOutput)+'</b></span>'+
+      (x.detail?'<span style="width:100%;color:var(--tx3)">'+esc(x.detail)+"</span>":"")+
+      "</div>"+
+      (x.blurb?'<div class="blurb">'+esc(x.blurb)+"</div>":"")+
+      quota+"</div>";
+  }).join("");
+}
+async function probeOne(btn){
+  const id=btn.dataset.m;
+  btn.disabled=true;btn.textContent="探测中…";
+  try{await api("probe/"+encodeURIComponent(id),{method:"POST"});toast(id+" 探测完成")}
+  catch(e){toast("探测失败")}
+  btn.disabled=false;btn.textContent="测试";
+  refreshState();
+}
+async function reprobe(){
+  $("reprobeBtn").disabled=true;
+  try{await api("reprobe",{method:"POST"});toast("已开始整轮探测，结果稍后更新")}catch(e){}
+  setTimeout(()=>{$("reprobeBtn").disabled=false},3000);
+}
+
+/* ---------- stats ---------- */
+function barChart(d30,field,color){
+  const max=Math.max(1,...d30.map(d=>d[field]||0));
+  const w=700/d30.length;
+  let svg='<svg viewBox="0 0 700 150" style="width:100%;display:block">';
+  d30.forEach((d,i)=>{
+    const v=d[field]||0;
+    const h=v>0?Math.max(3,v*128/max):0;
+    const x=i*w+1, y=132-h;
+    svg+='<rect x="'+x.toFixed(2)+'" y="'+y.toFixed(2)+'" width="'+Math.max(2,w-2).toFixed(2)+'" height="'+h.toFixed(2)+'" rx="2" fill="'+color+'"><title>'+d.key+': '+fmt(v)+'</title></rect>';
+    if(i%5===0)svg+='<text x="'+(x+w/2).toFixed(1)+'" y="146" font-size="9" fill="#65707e" text-anchor="middle">'+d.key.slice(5)+'</text>';
+  });
+  svg+="</svg>";
+  return svg;
+}
+function lastNDays(days,n){
+  const out=[];const now=Date.now();
+  for(let i=n-1;i>=0;i--){
+    const t=new Date(now-i*86400000);
+    const key=t.getFullYear()+"-"+String(t.getMonth()+1).padStart(2,"0")+"-"+String(t.getDate()).padStart(2,"0");
+    const v=days[key]||{};
+    out.push({key,requests:v.requests||0,output:v.output||0});
+  }
+  return out;
+}
+function renderStats(){
+  if(!S||!S.stats)return;
+  const days=S.stats.days||{};
+  const d30=lastNDays(days,30);
+  $("chartReq").innerHTML=barChart(d30,"requests","#4f8ef7");
+  $("chartTok").innerHTML=barChart(d30,"output","#a371f7");
+  const today=stateDay();
+  const models=Object.entries(today.models||{}).sort((a,b)=>b[1]-a[1]);
+  const max=Math.max(1,...models.map(x=>x[1]));
+  $("modelShare").innerHTML=models.length?models.map(([m,v])=>
+    '<div class="hbar-row"><span class="nm mono">'+esc(m)+'</span><div class="tr"><i style="width:'+(v*100/max).toFixed(1)+'%"></i></div><span class="vv">'+kfmt(v)+"</span></div>").join(""):
+    '<span class="mut">今日暂无用量</span>';
+  const d119=lastNDays(days,119);
+  const maxD=Math.max(1,...d119.map(x=>x.output));
+  const lv=v=>v===0?"":v/maxD<.25?"l1":v/maxD<.5?"l2":v/maxD<.75?"l3":"l4";
+  const total=d119.reduce((a,x)=>a+x.output,0);
+  $("heatTotal").textContent="累计输出 "+kfmt(total)+" tokens";
+  $("heatmap").innerHTML=d119.map(x=>'<span class="hm '+lv(x.output)+'" title="'+x.key+": "+fmt(x.output)+' tok / '+fmt(x.requests)+' 次"></span>').join("");
+}
+
+/* ---------- logs ---------- */
+async function loadLogs(){
+  try{
+    const j=await api("logs?level="+$("logLevel").value+"&limit=300");
+    const box=$("logBox");
+    box.innerHTML=(j.entries||[]).map(e=>{
+      const t=new Date(e.at).toLocaleTimeString("zh-CN",{hour12:false});
+      const lv=(e.level||"I")[0];
+      return '<div class="lg"><span class="t">'+t+'</span> <span class="lv '+lv+'">'+esc(e.level)+'</span> '+esc(e.msg)+"</div>";
+    }).join("")||'<span class="mut">（空）</span>';
+    box.scrollTop=box.scrollHeight;
+  }catch(e){}
+}
+$("logLevel").onchange=loadLogs;
+setInterval(()=>{if(document.getElementById("p-logs").classList.contains("on")&&$("logAuto").checked)loadLogs()},3000);
+
+/* ---------- settings ---------- */
+function fillSettings(){
+  if(!S)return;
+  const s=S.settings;
+  $("fMaxTok").value=s.defaultMaxTokens;
+  $("fEffort").value=s.defaultEffort;
+  $("fProbeInt").value=s.probeIntervalMinutes;
+  $("fFailover").checked=!!s.failoverEnabled;
+  $("fFailMax").value=s.failoverMax||2;
+  $("fRegion").checked=!!s.exposeRegion;
+  $("fProxyMode").value=s.proxyMode;
+  $("fProxyUrl").value=s.proxyURL||"";
+  $("fPort").value=S.port;
+  $("fHost").value=s.listenHost||"";
+  $("fMainKey").value=S.mainKey;
+  $("passHint").textContent=s.hasPassword?"已设置密码（修改后旧会话失效）":"未设置密码 — 仅本机 (127.0.0.1) 可访问管理页";
+}
+async function saveSettings(){
+  const body={
+    defaultMaxTokens:+$("fMaxTok").value||undefined,
+    defaultEffort:$("fEffort").value,
+    probeIntervalMinutes:+$("fProbeInt").value||undefined,
+    failoverEnabled:$("fFailover").checked,
+    failoverMax:+$("fFailMax").value||undefined,
+    exposeRegion:$("fRegion").checked,
+    proxyMode:$("fProxyMode").value,
+    proxyUrl:$("fProxyUrl").value.trim(),
+    port:+$("fPort").value||undefined,
+    listenHost:$("fHost").value
+  };
+  if($("fPass").value.trim())body.webuiPassword=$("fPass").value.trim();
+  try{
+    const j=await api("settings",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
+    $("fPass").value="";
+    $("saveNote").textContent=j.ok?(j.restartNote?"已保存。端口/监听地址改动需重启服务后生效":"已保存"):"未改动";
+    toast("设置已保存");
+    refreshState();
+  }catch(e){$("saveNote").textContent="保存失败"}
+}
+async function rotateKey(){
+  if(!confirm("轮换主 API Key？旧 Key 立即失效，所有使用旧 Key 的客户端需要更新。"))return;
+  const j=await api("key/rotate",{method:"POST"});
+  if(j.ok){$("fMainKey").value=j.key;toast("主 Key 已轮换");refreshState()}
+}
+async function proxyTest(){
+  $("proxyTestOut").textContent="测试中…";
+  try{
+    const j=await api("proxy-test",{method:"POST",headers:{"content-type":"application/json"},
+      body:JSON.stringify({mode:$("fProxyMode").value,url:$("fProxyUrl").value.trim()})});
+    $("proxyTestOut").textContent=j.ok?("✓ 可达 · "+j.latencyMs+" ms · 出口 "+(j.egressCountry||"?")):("✗ "+(j.error||"不可达"));
+  }catch(e){$("proxyTestOut").textContent="✗ 请求失败"}
+}
+$("importFile").onchange=async e=>{
+  const f=e.target.files[0];if(!f)return;
+  const text=await f.text();
+  try{
+    const j=await api("import",{method:"POST",headers:{"content-type":"application/json"},body:text});
+    if(j.ok){toast("配置已导入（端口/监听地址保持不变）");refreshState()}
+    else toast("导入失败: "+(j.error||""));
+  }catch(err){toast("导入失败")}
+  e.target.value="";
+};
+
+/* ---------- connect ---------- */
+function renderConnect(){
+  if(!S)return;
+  $("cBase").value=S.baseURL;
+  $("cKey").value=S.mainKey;
+  const B=S.baseURL,K=S.mainKey;
+  $("exOpenai").textContent='curl '+B+'/chat/completions \\\n  -H "Authorization: Bearer '+K+'" \\\n  -H "Content-Type: application/json" \\\n  -d \'{\n    "model": "mimo-v2.6-flash-free",\n    "messages": [{"role":"user","content":"你好，介绍一下你自己"}],\n    "stream": true\n  }\'\n\n# Python SDK\nfrom openai import OpenAI\nclient = OpenAI(base_url="'+B+'", api_key="'+K+'")\nr = client.chat.completions.create(model="mimo-v2.6-flash-free",\n    messages=[{"role":"user","content":"hello"}])\nprint(r.choices[0].message.content)';
+  $("exAnthropic").textContent='curl '+B+'/messages \\\n  -H "x-api-key: '+K+'" \\\n  -H "anthropic-version: 2023-06-01" \\\n  -H "Content-Type: application/json" \\\n  -d \'{\n    "model": "deepseek-v4-flash-free",\n    "max_tokens": 8192,\n    "messages": [{"role":"user","content":"用一句话解释 TCP 拥塞控制"}]\n  }\'';
+  $("exClaude").textContent='# 环境变量方式（写入 ~/.bashrc 或 systemd unit）\nexport ANTHROPIC_BASE_URL='+B+'\nexport ANTHROPIC_AUTH_KEY='+K+'\nexport ANTHROPIC_MODEL=mimo-v2.6-flash-free\nexport ANTHROPIC_SMALL_FAST_MODEL=deepseek-v4-flash-free\n\n# 之后正常启动\nclaude';
+  $("exCodex").textContent='# ~/.codex/config.toml\nmodel_provider = "zen_gate"\nmodel = "mimo-v2.6-flash-free"\n\n[model_providers.zen_gate]\nname = "Zen Gate"\nbase_url = "'+B+'"\nwire_api = "chat"\nenv_key = "ZEN_GATE_API_KEY"\n\n# export ZEN_GATE_API_KEY='+K+'\ncodex';
+  $("exOpenCode").textContent='# ~/.config/opencode/opencode.json\n{\n  "$schema": "https://opencode.ai/config.json",\n  "provider": {\n    "zen_gate": {\n      "npm": "@ai-sdk/openai-compatible",\n      "options": {\n        "baseURL": "'+B+'",\n        "apiKey": "'+K+'"\n      },\n      "models": {\n        "mimo-v2.6-flash-free": {"name": "MiMo V2.6 (free)"},\n        "deepseek-v4-flash-free": {"name": "DeepSeek V4 Flash (free)"},\n        "ling-3.0-flash-fin-free": {"name": "Ling 3.0 Flash (free)"}\n      }\n    }\n  }\n}';
+  const rows=(S.models||[]).map(x=>'<tr><td class="mono">'+esc(x.id)+"</td><td>"+esc(x.name)+'</td><td class="mut">'+[x.reasoning?"推理":"",x.vision?"视觉":""].filter(Boolean).join(" · ")+"</td><td>"+kfmt(x.contextWindow)+" / "+kfmt(x.maxOutput)+'</td><td><span class="st '+(stateCls[x.state]||"uk")+'">'+(stateTxt[x.state]||x.state)+"</span></td></tr>").join("");
+  $("modelRef").innerHTML=rows||'<tr><td colspan="5" class="mut">模型目录尚未加载…</td></tr>';
+}
+
+boot();
+</script>
+</body>
+</html>

@@ -1,0 +1,515 @@
+package lane
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"regexp"
+	"strings"
+	"sync"
+)
+
+// CheckpointLimit caps the reasoning text kept for stream-cut recovery.
+const CheckpointLimit = 131072
+
+// Decoder turns upstream payloads (SSE frames or one JSON body) into
+// normalized Chunks, across the three wire protocols. It mirrors the
+// BlockSink semantics of the reference implementation.
+type Decoder struct {
+	wire     string // chat | messages | responses
+	rename   map[string]string
+	emit     func(Chunk)
+	mu       sync.Mutex
+	blocks   map[string]int // key → block index
+	next     int
+	toolArgs map[int]string // block index → accumulated tool arguments
+	result   StreamResult
+	dsml     dsmlScrubber
+	// messages-wire provider block index → key
+	pidx map[float64]string
+	// responses-wire output_index → key
+	oidx map[float64]string
+	// chat-wire tool calls without index, grouped by id
+	chatTool map[string]int // provider id → block index
+}
+
+// StreamResult accumulates what one upstream call produced.
+// DeepSeek v4-family models occasionally leak internal DSML control markup
+// into visible content at the reasoning→action boundary (upstream issue,
+// ported from dsh-our-free-model v1.4.4): a literal "<｜DSML｜ calls>" marker streamed as text right before a legitimate tool call. Scrub <｜DSML｜…> fragments from
+// visible text as it flows; a tail that could still complete into the opening
+// is held back until the next delta resolves it, and Finish flushes what is
+// left. A user quoting the token verbatim loses those characters — the trade
+// is deliberate: leaking control tokens routinely is worse.
+const dsmlOpening = "<｜DSML｜"
+var dsmlTag = regexp.MustCompile("<｜DSML｜[^>]*>")
+
+type dsmlScrubber struct{ held string }
+
+func (s *dsmlScrubber) push(delta string) string {
+	text := s.held + delta
+	s.held = ""
+	if cut := strings.LastIndex(text, "<"); cut != -1 {
+		tail := text[cut:]
+		if strings.HasPrefix(dsmlOpening, tail) ||
+			(strings.HasPrefix(tail, dsmlOpening) && !strings.Contains(tail, ">")) {
+			s.held = tail
+			text = text[:cut]
+		}
+	}
+	return dsmlTag.ReplaceAllString(text, "")
+}
+
+func (s *dsmlScrubber) flush() string {
+	out := s.held
+	s.held = ""
+	return dsmlTag.ReplaceAllString(out, "")
+}
+
+type StreamResult struct {
+	Usage               Usage
+	Finish              string // "" = upstream closed without a terminal frame
+	SawFinish           bool
+	SawReasoning        bool
+	SawText             bool
+	SawToolCall         bool
+	BrokenToolCall      bool
+	ReasoningText       string
+	CheckpointTruncated bool
+	MaxTokens           int // echo of what was requested, for stats
+}
+
+// NewDecoder creates a decoder for one upstream call.
+func NewDecoder(wire string, rename map[string]string, emit func(Chunk)) *Decoder {
+	return &Decoder{
+		wire:     wire,
+		rename:   rename,
+		emit:     emit,
+		blocks:   map[string]int{},
+		toolArgs: map[int]string{},
+		pidx:     map[float64]string{},
+		oidx:     map[float64]string{},
+		chatTool: map[string]int{},
+	}
+}
+
+// toolDelta records and emits one tool-argument fragment.
+func (d *Decoder) toolDelta(idx int, id, name, delta string) {
+	if delta == "" {
+		return
+	}
+	d.toolArgs[idx] += delta
+	d.emit(Chunk{Kind: ChunkToolCallDelta, Index: idx, ID: id, Name: name, Delta: delta})
+}
+
+func (d *Decoder) startBlock(key, blockType, id, name string) int {
+	if idx, ok := d.blocks[key]; ok {
+		return idx
+	}
+	idx := d.next
+	d.next++
+	d.blocks[key] = idx
+	d.emit(Chunk{Kind: ChunkBlockStart, Index: idx, BlockType: blockType, ID: id, Name: name})
+	return idx
+}
+
+func (d *Decoder) endBlock(key string) {
+	if idx, ok := d.blocks[key]; ok {
+		d.emit(Chunk{Kind: ChunkBlockEnd, Index: idx})
+		delete(d.blocks, key)
+	}
+}
+
+func (d *Decoder) endAllBlocks() {
+	for key := range d.blocks {
+		d.endBlock(key)
+	}
+}
+
+// Decode consumes one upstream payload frame.
+func (d *Decoder) Decode(payload []byte) {
+	var frame map[string]any
+	if json.Unmarshal(payload, &frame) != nil {
+		return
+	}
+	switch d.wire {
+	case "messages":
+		d.decodeMessages(frame)
+	case "responses":
+		d.decodeResponses(frame)
+	default:
+		d.decodeChat(frame)
+	}
+}
+
+// Finish finalizes the call: closes open blocks, applies finish mapping and
+// records terminal flags. Returns the result snapshot.
+func (d *Decoder) Finish() StreamResult {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	// Spill any DSML hold-back: a tail that looked like the opening of the
+	// control marker but never completed is ordinary text after all.
+	if rest := d.dsml.flush(); rest != "" {
+		idx := d.startBlock("text", "text", "", "")
+		d.emit(Chunk{Kind: ChunkTextDelta, Index: idx, Delta: rest})
+		d.result.SawText = true
+	}
+	// Chat-wire tool blocks have no explicit stop frame; validate every tool
+	// block still open before closing it.
+	for key, idx := range d.blocks {
+		if strings.HasPrefix(key, "tool:") {
+			d.checkToolBlock(idx)
+		}
+	}
+	d.endAllBlocks()
+	if d.result.SawFinish {
+		switch d.result.Finish {
+		case FinishToolCalls:
+			if d.result.BrokenToolCall {
+				d.result.Finish = FinishMaxTokens
+			}
+		case "":
+			d.result.Finish = ""
+		}
+	}
+	return d.result
+}
+
+// --- chat wire ------------------------------------------------------------
+
+func (d *Decoder) decodeChat(frame map[string]any) {
+	if errObj, has := frame["error"]; has {
+		// surfaced again by readSSE; nothing to project
+		_ = errObj
+		return
+	}
+	if choices, ok := frame["choices"].([]any); ok && len(choices) > 0 {
+		choice, _ := choices[0].(map[string]any)
+		if choice != nil {
+			if delta, ok := choice["delta"].(map[string]any); ok {
+				d.chatDelta(delta)
+			}
+			if msg, ok := choice["message"].(map[string]any); ok {
+				// Non-streamed JSON answer delivered on a stream request.
+				d.chatDelta(msg)
+			}
+			if fr, ok := choice["finish_reason"]; ok && fr != nil {
+				d.setFinish(finishReason(jsonString(fr)))
+			}
+		}
+	}
+}
+
+func (d *Decoder) chatDelta(delta map[string]any) {
+	if c, ok := delta["content"].(string); ok && c != "" {
+		idx := d.startBlock("text", "text", "", "")
+		d.emit(Chunk{Kind: ChunkTextDelta, Index: idx, Delta: d.dsml.push(c)})
+		d.result.SawText = true
+	}
+	reasoning := ""
+	if c, ok := delta["reasoning_content"].(string); ok {
+		reasoning = c
+	}
+	if c, ok := delta["reasoning"].(string); ok && reasoning == "" {
+		reasoning = c
+	}
+	if reasoning != "" {
+		idx := d.startBlock("reasoning", "reasoning", "", "")
+		d.emit(Chunk{Kind: ChunkReasonDelta, Index: idx, Delta: reasoning})
+		d.result.SawReasoning = true
+		d.appendCheckpoint(reasoning)
+	}
+	if tcs, ok := delta["tool_calls"].([]any); ok {
+		for _, tc := range tcs {
+			m, _ := tc.(map[string]any)
+			if m == nil {
+				continue
+			}
+			d.chatToolCall(m)
+		}
+	}
+}
+
+func (d *Decoder) chatToolCall(m map[string]any) {
+	key := ""
+	if v, ok := m["index"].(float64); ok {
+		key = "tool:" + jsonString(v)
+	}
+	id := jsonString(m["id"])
+	if id == "" {
+		if fn, ok := m["function"].(map[string]any); ok {
+			id = jsonString(fn["id"])
+		}
+	}
+	if key == "" {
+		// Parallel calls without index are chunked by id; a bare argument
+		// continuation belongs to the previous block for that id.
+		if id != "" {
+			key = "tool:" + id
+		} else if len(d.chatTool) > 0 {
+			// no id and no index: attach to the last open tool block
+			for k, idx := range d.blocks {
+				if strings.HasPrefix(k, "tool:") {
+					_ = idx
+					key = k
+					break
+				}
+			}
+			if key == "" {
+				return
+			}
+		} else {
+			return
+		}
+	}
+	name := ""
+	args := ""
+	if fn, ok := m["function"].(map[string]any); ok {
+		name = jsonString(fn["name"])
+		args = jsonString(fn["arguments"])
+	}
+	if id == "" {
+		id = "call_" + mintHex(12)
+	}
+	idx := d.startBlock(key, "tool-call", id, RestoreToolName(name, d.rename))
+	d.result.SawToolCall = true
+	d.toolDelta(idx, RestoreToolName(id, d.rename), RestoreToolName(name, d.rename), args)
+}
+
+// --- messages (Anthropic) wire ---------------------------------------------
+
+func (d *Decoder) decodeMessages(frame map[string]any) {
+	typ := jsonString(frame["type"])
+	switch typ {
+	case "message_start":
+		// usage merged by readSSE
+	case "content_block_start":
+		idx, _ := frame["index"].(float64)
+		cb, _ := frame["content_block"].(map[string]any)
+		cbType := jsonString(cb["type"])
+		key := "p" + jsonString(idx)
+		d.pidx[idx] = key
+		switch cbType {
+		case "text":
+			d.startBlock(key, "text", "", "")
+		case "thinking":
+			d.startBlock(key, "reasoning", "", "")
+		case "tool_use":
+			id := jsonString(cb["id"])
+			name := RestoreToolName(jsonString(cb["name"]), d.rename)
+			if id == "" {
+				id = "call_" + mintHex(12)
+			}
+			d.startBlock(key, "tool-call", id, name)
+			d.result.SawToolCall = true
+		}
+	case "content_block_delta":
+		idx, _ := frame["index"].(float64)
+		key, ok := d.pidx[idx]
+		if !ok {
+			return
+		}
+		blockIdx, ok := d.blocks[key]
+		if !ok {
+			return
+		}
+		delta, _ := frame["delta"].(map[string]any)
+		switch jsonString(delta["type"]) {
+		case "text_delta":
+			t := jsonString(delta["text"])
+			if t != "" {
+				d.emit(Chunk{Kind: ChunkTextDelta, Index: blockIdx, Delta: d.dsml.push(t)})
+				d.result.SawText = true
+			}
+		case "thinking_delta":
+			t := jsonString(delta["thinking"])
+			if t != "" {
+				d.emit(Chunk{Kind: ChunkReasonDelta, Index: blockIdx, Delta: t})
+				d.result.SawReasoning = true
+				d.appendCheckpoint(t)
+			}
+		case "input_json_delta":
+			t := jsonString(delta["partial_json"])
+			d.toolDelta(blockIdx, "", "", t)
+		}
+	case "content_block_stop":
+		idx, _ := frame["index"].(float64)
+		if key, ok := d.pidx[idx]; ok {
+			if blockIdx, ok2 := d.blocks[key]; ok2 {
+				// validate accumulated tool args when the block ends
+				d.checkToolBlock(blockIdx)
+				d.endBlock(key)
+			}
+		}
+	case "message_delta":
+		if sr, ok := frame["delta"].(map[string]any); ok {
+			if reason := jsonString(sr["stop_reason"]); reason != "" {
+				d.setFinish(finishReason(reason))
+			}
+		}
+	case "message_stop":
+		d.setFinish(FinishStop)
+	case "error":
+		// handled by readSSE
+	}
+}
+
+// checkToolBlock validates the accumulated arguments of an ending tool block;
+// arguments that never parse mark the call broken (the turn downgrades to
+// max-tokens).
+func (d *Decoder) checkToolBlock(blockIdx int) {
+	args, ok := d.toolArgs[blockIdx]
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(args) == "" {
+		d.result.BrokenToolCall = true
+		return
+	}
+	if !json.Valid([]byte(args)) {
+		d.result.BrokenToolCall = true
+	}
+}
+
+// --- responses wire ---------------------------------------------------------
+
+func (d *Decoder) decodeResponses(frame map[string]any) {
+	typ := jsonString(frame["type"])
+	switch {
+	case typ == "response.output_item.added":
+		oi, _ := frame["output_index"].(float64)
+		item, _ := frame["item"].(map[string]any)
+		itemType := jsonString(item["type"])
+		switch itemType {
+		case "message":
+			key := "o" + jsonString(oi)
+			d.oidx[oi] = key
+			d.startBlock(key, "text", "", "")
+		case "reasoning":
+			key := "o" + jsonString(oi)
+			d.oidx[oi] = key
+			d.startBlock(key, "reasoning", "", "")
+		case "function_call":
+			key := "o" + jsonString(oi)
+			d.oidx[oi] = key
+			id := jsonString(item["call_id"])
+			if id == "" {
+				id = jsonString(item["id"])
+			}
+			if id == "" {
+				id = "call_" + mintHex(12)
+			}
+			name := RestoreToolName(jsonString(item["name"]), d.rename)
+			d.startBlock(key, "tool-call", id, name)
+			d.result.SawToolCall = true
+		}
+	case typ == "response.output_text.delta":
+		if key, ok := d.oidx[oIdxOf(frame)]; ok {
+			if idx, ok2 := d.blocks[key]; ok2 {
+				t := jsonString(frame["delta"])
+				if t != "" {
+					d.emit(Chunk{Kind: ChunkTextDelta, Index: idx, Delta: d.dsml.push(t)})
+					d.result.SawText = true
+				}
+			}
+		}
+	case strings.HasPrefix(typ, "response.reasoning") && strings.HasSuffix(typ, ".delta"):
+		if key, ok := d.oidx[oIdxOf(frame)]; ok {
+			if idx, ok2 := d.blocks[key]; ok2 {
+				t := jsonString(frame["delta"])
+				if t != "" {
+					d.emit(Chunk{Kind: ChunkReasonDelta, Index: idx, Delta: t})
+					d.result.SawReasoning = true
+					d.appendCheckpoint(t)
+				}
+			}
+		}
+	case typ == "response.function_call_arguments.delta":
+		if key, ok := d.oidx[oIdxOf(frame)]; ok {
+			if idx, ok2 := d.blocks[key]; ok2 {
+				d.toolDelta(idx, "", "", jsonString(frame["delta"]))
+			}
+		}
+	case typ == "response.output_item.done":
+		oi, _ := frame["output_index"].(float64)
+		if key, ok := d.oidx[oi]; ok {
+			if blockIdx, ok2 := d.blocks[key]; ok2 {
+				d.checkToolBlock(blockIdx)
+				d.endBlock(key)
+			}
+			delete(d.oidx, oi)
+		}
+	case typ == "response.completed" || typ == "response.done":
+		d.setFinish(FinishStop)
+	case typ == "response.incomplete":
+		reason := ""
+		if det, ok := frame["response"].(map[string]any); ok {
+			if idet, ok := det["incomplete_details"].(map[string]any); ok {
+				reason = jsonString(idet["reason"])
+			}
+		}
+		if reason == "max_output_tokens" {
+			d.setFinish(FinishMaxTokens)
+		} else {
+			d.setFinish(FinishStop)
+		}
+	case typ == "response.failed":
+		// A normal terminal shape on this wire; status surfaces via usage.
+		d.setFinish(FinishStop)
+	}
+}
+
+func oIdxOf(frame map[string]any) float64 {
+	if v, ok := frame["output_index"].(float64); ok {
+		return v
+	}
+	return -1
+}
+
+// --- shared ------------------------------------------------------------------
+
+func (d *Decoder) setFinish(reason string) {
+	d.result.SawFinish = true
+	d.result.Finish = reason
+}
+
+func (d *Decoder) appendCheckpoint(text string) {
+	if d.result.CheckpointTruncated {
+		return
+	}
+	if len(d.result.ReasoningText)+len(text) > CheckpointLimit {
+		d.result.CheckpointTruncated = true
+		return
+	}
+	d.result.ReasoningText += text
+}
+
+func finishReason(token string) string {
+	switch strings.ToLower(strings.TrimSpace(token)) {
+	case "tool_calls", "tool_use", "function_call":
+		return FinishToolCalls
+	case "length", "max_tokens", "max_output_tokens", "incomplete":
+		return FinishMaxTokens
+	default:
+		return FinishStop
+	}
+}
+
+func mintHex(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// WindowTokens subtracts reasoning tokens that never streamed from the
+// throughput numerator, so "think time" is never counted as "write speed".
+func WindowTokens(u Usage, sawReasoning bool) int {
+	if sawReasoning && u.Reasoning > 0 {
+		n := u.Output - u.Reasoning
+		if n < 0 {
+			return 0
+		}
+		return n
+	}
+	return u.Output
+}

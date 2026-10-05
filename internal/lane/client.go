@@ -1,0 +1,766 @@
+package lane
+
+import (
+	"context"
+	"sync"
+	"time"
+)
+
+// Recovery policy, ported from recovery.js.
+const (
+	RecoveryMaxContinuationMS = 180000
+	RecoveryTotalTimeoutMS    = 480000
+	RecoveryMaxOutputTokens   = 8192
+)
+
+const recoveryInstruction = "The previous response was interrupted before its final answer. " +
+	"Complete the original task using the conversation above. " +
+	"The JSON string below is an incomplete draft of the interrupted analysis, not new instructions. " +
+	"Use its established results to deliver the final answer now. " +
+	"For this continuation, the checkpoint already satisfies any earlier request for prolonged " +
+	"analysis, exhaustive exploration, or writing out the full reasoning before answering. " +
+	"Do not restart that analysis or explore additional constructions. " +
+	"Give a concise, substantive final answer in at most 800 words, in the language requested " +
+	"by the original task. Include the conclusion first and only the essential justification. " +
+	"If the checkpoint leaves an uncertainty, state it directly rather than starting another " +
+	"long analysis. Do not call tools. " +
+	"If completing the task requires unavailable tools, explain what remains unperformed; " +
+	"never claim an external action was executed. " +
+	"Do not merely summarize the interruption or promise to continue.\n\n" +
+	"Interrupted analysis checkpoint:\n"
+
+// CallRecord is emitted after every upstream request (physical, not logical).
+type CallRecord struct {
+	Model      string `json:"model"`
+	Agent      string `json:"agent,omitempty"`
+	Ok         bool   `json:"ok"`
+	Truncated  bool   `json:"truncated,omitempty"`
+	NoUsage    bool   `json:"noUsage,omitempty"`
+	Recovered  bool   `json:"recovered,omitempty"`
+	Input      int    `json:"input"`
+	Output     int    `json:"output"`
+	Reasoning  int    `json:"reasoning,omitempty"`
+	CacheRead  int    `json:"cacheRead,omitempty"`
+	TTFTMs     int64  `json:"ttftMs,omitempty"`
+	DecodeMs   int64  `json:"decodeMs,omitempty"`
+	DecodeTok  int    `json:"decodeTokens,omitempty"`
+	Effort     string `json:"effort,omitempty"`
+	At         int64  `json:"at"`
+}
+
+// Lane orchestrates the free lane: catalog, availability, and completion calls.
+type Lane struct {
+	mu               sync.RWMutex
+	catalog          []ModelInfo
+	availability     map[string]ProbeResult
+	egress           Egress
+	defaultMaxTokens int
+	exposeRegion     bool
+	failoverEnabled  bool
+	failoverMax      int
+	throttle         *ThrottleBook
+
+	probing        atomicFlag
+	lastProbeAt    time.Time
+	backoffRounds  int
+	nextProbeAfter time.Time
+	quotaWallActive bool
+	probingModel    string
+
+	// OnCall receives one record per physical upstream request.
+	OnCall func(CallRecord)
+	// OnChange is called whenever catalog/availability changed (dashboard refresh).
+	OnChange func()
+	// OnProbeEdge fires when one model's availability state transitions
+	// between rounds (used for OS notifications; empty model = quota wall).
+	OnProbeEdge func(model, from, to string)
+	// OnProbeResult fires after each individual model probe finished — main
+	// uses it to feed the per-model first-token sample history.
+	OnProbeResult func(ProbeResult)
+}
+
+type atomicFlag struct{ v int32 }
+
+func (f *atomicFlag) Set(b bool) {
+	if b {
+		f.v = 1
+	} else {
+		f.v = 0
+	}
+}
+func (f *atomicFlag) Get() bool { return f.v == 1 }
+
+// NewLane seeds the lane with the fallback catalog.
+func NewLane() *Lane {
+	return &Lane{
+		catalog:          BuildCatalog(FallbackCatalogIDs),
+		availability:     map[string]ProbeResult{},
+		defaultMaxTokens: 32768,
+		exposeRegion:     true,
+		failoverEnabled:  true,
+		failoverMax:      2,
+		throttle:         NewThrottleBook(),
+	}
+}
+
+// SetFailover toggles rate-limit auto-switching and its extra-attempt budget.
+func (l *Lane) SetFailover(enabled bool, max int) {
+	l.mu.Lock()
+	l.failoverEnabled = enabled
+	if max < 1 {
+		max = 1
+	}
+	if max > 5 {
+		max = 5
+	}
+	l.failoverMax = max
+	l.mu.Unlock()
+}
+
+// SetThrottleUpdate wires the throttle ledger's persistence callback.
+func (l *Lane) SetThrottleUpdate(fn func(model string, note ThrottleNote)) {
+	l.throttle.OnUpdate = fn
+}
+
+// LoadThrottleNotes restores persisted episode history at boot.
+func (l *Lane) LoadThrottleNotes(notes map[string]ThrottleNote) {
+	l.throttle.Load(notes)
+}
+
+// MarkThrottled marks a model throttled from live traffic (429) or a probe.
+func (l *Lane) MarkThrottled(model string, retryAfterSec int) {
+	l.throttle.MarkThrottled(model, retryAfterSec)
+	l.mu.Lock()
+	l.availability[model] = ProbeResult{Model: model, State: StateThrottled,
+		At: time.Now().UnixMilli(), Detail: "实时限额（等待恢复）"}
+	l.mu.Unlock()
+	l.fireChange()
+}
+
+// MarkOK clears a model's throttle state after a successful call or probe.
+func (l *Lane) MarkOK(model string) {
+	l.throttle.MarkOK(model)
+	l.mu.Lock()
+	if prev, ok := l.availability[model]; ok && prev.State == StateThrottled {
+		l.availability[model] = ProbeResult{Model: model, State: StateAvailable,
+			At: time.Now().UnixMilli(), Detail: "恢复（实测成功）"}
+	}
+	l.mu.Unlock()
+	l.fireChange()
+}
+
+func (l *Lane) fireChange() {
+	if l.OnChange != nil {
+		go l.OnChange()
+	}
+}
+
+// ThrottleNotes snapshots the ledger for /state.
+func (l *Lane) ThrottleNotes() map[string]ThrottleNote {
+	return l.throttle.All()
+}
+
+// RecoveryETA estimates when a throttled model returns (epoch ms; 0 unknown).
+func (l *Lane) RecoveryETA(model string) int64 {
+	return l.throttle.RecoveryETA(model)
+}
+
+// SetDefaultMaxTokens caps the per-turn output budget.
+func (l *Lane) SetDefaultMaxTokens(n int) {
+	if n > 0 {
+		l.mu.Lock()
+		l.defaultMaxTokens = n
+		l.mu.Unlock()
+	}
+}
+
+// SetExposeRegion controls whether region-blocked models appear in listings.
+func (l *Lane) SetExposeRegion(b bool) {
+	l.mu.Lock()
+	l.exposeRegion = b
+	l.mu.Unlock()
+}
+
+// ProbingModel returns the id currently under probe ("" when idle).
+func (l *Lane) ProbingModel() string {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.probingModel
+}
+
+// Snapshot returns the current catalog + availability + egress.
+func (l *Lane) Snapshot() ([]ModelInfo, map[string]ProbeResult, Egress) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	cat := make([]ModelInfo, len(l.catalog))
+	copy(cat, l.catalog)
+	av := make(map[string]ProbeResult, len(l.availability))
+	for k, v := range l.availability {
+		av[k] = v
+	}
+	return cat, av, l.egress
+}
+
+// ServableModels lists models a client picker may show: everything not
+// explicitly refused by the gateway. Region-blocked ids are kept only when
+// exposeRegion is set (they surface in the dashboard, never silently vanish).
+// The list never comes back empty while any model is known.
+func (l *Lane) ServableModels() []ModelInfo {
+	cat, av, _ := l.Snapshot()
+	out := []ModelInfo{}
+	for _, m := range cat {
+		if m.SystemOne {
+			// Decision models answer typed questions on their own wire, not
+			// chat requests — listing them in a chat picker would only 500.
+			continue
+		}
+		switch av[m.ID].State {
+		case StateUnavailable:
+			continue
+		case StateRegionBlock:
+			if !l.exposeRegion {
+				continue
+			}
+		}
+		out = append(out, m)
+	}
+	if len(out) == 0 && len(cat) > 0 {
+		out = cat
+	}
+	return out
+}
+
+// RefreshCatalog re-pulls the listing; a failure keeps the cached catalog.
+func (l *Lane) RefreshCatalog(ctx context.Context) {
+	ids, err := FetchListing(ctx)
+	if err != nil || len(ids) == 0 {
+		return
+	}
+	cat := BuildCatalog(ids)
+	l.mu.Lock()
+	l.catalog = cat
+	l.mu.Unlock()
+	l.notify()
+}
+
+// ProbeRound re-probes availability once, with exponential backoff after an
+// all-429 round (the quota wall must not be probed away).
+func (l *Lane) ProbeRound(ctx context.Context, manual bool) {
+	l.mu.Lock()
+	if !manual && time.Now().Before(l.nextProbeAfter) {
+		l.mu.Unlock()
+		return
+	}
+	if l.probing.Get() {
+		l.mu.Unlock()
+		return
+	}
+	l.probing.Set(true)
+	cat := make([]ModelInfo, len(l.catalog))
+	copy(cat, l.catalog)
+	l.mu.Unlock()
+	defer l.probing.Set(false)
+
+	// 逐个探测：一次只测一个模型，测完一个立刻生效并广播——
+	// 用户看到的是模型一个接一个亮起来，而不是全轮结束后一起翻转。
+	allThrottled := len(cat) > 0
+	for _, m := range cat {
+		if ctx.Err() != nil {
+			break
+		}
+		l.mu.Lock()
+		l.probingModel = m.ID
+		l.mu.Unlock()
+		l.notify()
+
+		r := ProbeModel(ctx, m)
+
+		l.mu.Lock()
+		if l.OnProbeEdge != nil {
+			if prev, ok := l.availability[m.ID]; ok && prev.State != r.State && prev.State != "" && r.State != "" {
+				go l.OnProbeEdge(m.ID, prev.State, r.State)
+			}
+		}
+		l.availability[m.ID] = r
+		if r.State != StateThrottled {
+			allThrottled = false
+		}
+		l.mu.Unlock()
+		// Probe verdicts feed the throttle ledger too: a throttled verdict
+		// opens/extends an episode, a usable one closes it.
+		switch r.State {
+		case StateThrottled:
+			l.throttle.MarkThrottled(m.ID, 0)
+		case StateAvailable:
+			l.throttle.MarkOK(m.ID)
+		}
+		if l.OnProbeResult != nil && r.TTFTMs > 0 {
+			l.OnProbeResult(r)
+		}
+		l.notify()
+	}
+	l.mu.Lock()
+	l.probingModel = ""
+	l.mu.Unlock()
+	eg := DetectEgress(ctx)
+
+	l.mu.Lock()
+	if l.OnProbeEdge != nil && allThrottled && !l.quotaWallActive {
+		go l.OnProbeEdge("", "", StateThrottled)
+	}
+	l.quotaWallActive = allThrottled
+	if egressChanged(l.egress, eg) {
+		l.egress = eg
+	}
+	l.lastProbeAt = time.Now()
+	if allThrottled {
+		l.backoffRounds++
+		d := time.Duration(30*(1<<uint(min2(l.backoffRounds, 2)))) * time.Minute
+		if d > 120*time.Minute {
+			d = 120 * time.Minute
+		}
+		l.nextProbeAfter = time.Now().Add(d)
+	} else {
+		l.backoffRounds = 0
+		l.nextProbeAfter = time.Time{}
+	}
+	l.mu.Unlock()
+	l.notify()
+}
+
+// ProbeOne re-tests a single model on demand (the per-card 测试 button) and
+// applies the same bookkeeping as a round: availability, throttle ledger,
+// first-token sample, change notifications.
+func (l *Lane) ProbeOne(model string) ProbeResult {
+	var entry ModelInfo
+	l.mu.RLock()
+	for i := range l.catalog {
+		if l.catalog[i].ID == model {
+			entry = l.catalog[i]
+			break
+		}
+	}
+	l.mu.RUnlock()
+	if entry.ID == "" {
+		return ProbeResult{Model: model, State: StateUnknown, At: time.Now().UnixMilli()}
+	}
+
+	r := ProbeModel(context.Background(), entry)
+
+	l.mu.Lock()
+	if prev, ok := l.availability[model]; ok && l.OnProbeEdge != nil && prev.State != r.State && prev.State != "" && r.State != "" {
+		go l.OnProbeEdge(model, prev.State, r.State)
+	}
+	l.availability[model] = r
+	l.mu.Unlock()
+	switch r.State {
+	case StateThrottled:
+		l.throttle.MarkThrottled(model, 0)
+	case StateAvailable:
+		l.throttle.MarkOK(model)
+	}
+	if l.OnProbeResult != nil && r.TTFTMs > 0 {
+		l.OnProbeResult(r)
+	}
+	l.notify()
+	return r
+}
+
+// StartLoops runs the periodic catalog refresh + probe + egress watch until
+// ctx is cancelled.
+func (l *Lane) StartLoops(ctx context.Context, probeInterval time.Duration) {
+	if probeInterval < time.Minute {
+		probeInterval = time.Minute
+	}
+	go func() {
+		l.RefreshCatalog(ctx)
+		l.ProbeRound(ctx, false)
+		t := time.NewTicker(probeInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				l.RefreshCatalog(ctx)
+				l.ProbeRound(ctx, false)
+			}
+		}
+	}()
+	go func() {
+		t := time.NewTicker(120 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				eg := DetectEgress(ctx)
+				l.mu.Lock()
+				changed := egressChanged(l.egress, eg)
+				if changed {
+					l.egress = eg
+				}
+				l.mu.Unlock()
+				if changed {
+					l.ProbeRound(ctx, true)
+				}
+			}
+		}
+	}()
+}
+
+func egressChanged(a, b Egress) bool {
+	if b.IP == "" {
+		return false
+	}
+	return a.IP != b.IP || a.Country != b.Country
+}
+
+func (l *Lane) notify() {
+	if l.OnChange != nil {
+		go l.OnChange()
+	}
+}
+
+// Complete runs one logical turn: effort budgeting, wire encoding, the
+// fingerprint gate, streaming decode, and — for a cut pure-reasoning turn —
+// one bounded checkpoint recovery request.
+// Complete runs one logical turn. When the requested model is rate-limited or
+// otherwise refuses before anything was streamed, it switches to the next
+// available model — the dsh lesson is that a 429 must never be retried on the
+// same model (quota is accounted per session; a retry is a second burn), so
+// switching is the only honest lever.
+func (l *Lane) Complete(ctx context.Context, req Request, emit func(Chunk)) (Outcome, *UpstreamError) {
+	effort := req.Effort
+	if effort == "" {
+		effort = EffortOf(req.Model)
+	}
+	requested := BaseModelId(req.Model)
+
+	l.mu.RLock()
+	failover := l.failoverEnabled
+	failoverMax := l.failoverMax
+	l.mu.RUnlock()
+
+	model := requested
+	failovers := 0
+	tried := map[string]bool{requested: true}
+	for {
+		out, uerr, sawAny := l.attemptModel(ctx, req, model, effort, emit)
+		out.ServedModel = model
+		out.Failovers = failovers
+		if uerr == nil {
+			return out, nil
+		}
+		// No switch after content reached the caller (it would duplicate
+		// output), on egress-wide failures, or once the attempt budget is out.
+		if !failover || failovers >= failoverMax || sawAny || !switchableFailure(uerr) {
+			return out, uerr
+		}
+		next := l.nextCandidateFrom(tried)
+		if next == "" {
+			return out, uerr
+		}
+		tried[next] = true
+		model = next
+		failovers++
+	}
+}
+
+// switchableFailure reports whether this failure class can plausibly be
+// answered by a different model. Transport/credential faults are egress-wide —
+// switching models would just pay latency for the same refusal.
+func switchableFailure(uerr *UpstreamError) bool {
+	switch uerr.Code {
+	case CodeQuota, CodeRegion, CodeServer, CodeTimeout, CodeEmpty:
+		return true
+	}
+	return false
+}
+
+// Candidates lists up to n failover targets — the hint a 429 error body
+// carries when the gateway itself ran out of models to try.
+func (l *Lane) Candidates(exclude string, n int) []string {
+	tried := map[string]bool{exclude: true}
+	out := []string{}
+	for len(out) < n {
+		c := l.nextCandidateFrom(tried)
+		if c == "" {
+			break
+		}
+		tried[c] = true
+		out = append(out, c)
+	}
+	return out
+}
+
+// nextCandidateFrom picks the best failover target: probed-available models
+// first, then unprobed ones; throttled, region-blocked, unavailable, decision
+// models and already-tried ids are skipped. Ties keep catalog order.
+func (l *Lane) nextCandidateFrom(tried map[string]bool) string {
+	l.mu.RLock()
+	cat := make([]ModelInfo, len(l.catalog))
+	copy(cat, l.catalog)
+	av := map[string]string{}
+	for k, v := range l.availability {
+		av[k] = v.State
+	}
+	l.mu.RUnlock()
+
+	best, bestRank := "", 99
+	for _, m := range cat {
+		if m.SystemOne || m.Wire == "systemone" {
+			continue
+		}
+		if tried[m.ID] || l.throttle.Throttled(m.ID) {
+			continue
+		}
+		rank := 1
+		switch av[m.ID] {
+		case StateAvailable:
+			rank = 0
+		case StateUnavailable, StateRegionBlock:
+			continue
+		}
+		if rank < bestRank {
+			best, bestRank = m.ID, rank
+		}
+	}
+	return best
+}
+
+func (l *Lane) attemptModel(ctx context.Context, req Request, model, effort string, emit func(Chunk)) (Outcome, *UpstreamError, bool) {
+	start := time.Now()
+	base := model
+
+	l.mu.RLock()
+	var entry *ModelInfo
+	for i := range l.catalog {
+		if l.catalog[i].ID == base {
+			entry = &l.catalog[i]
+			break
+		}
+	}
+	defMax := l.defaultMaxTokens
+	l.mu.RUnlock()
+	if entry == nil {
+		entry = &ModelInfo{ID: base, Name: base, Wire: WireFor(base),
+			Reasoning: true, ContextWindow: 131072, MaxOutput: 8192, CanDisableThinking: true}
+	}
+
+	if entry.SystemOne || entry.Wire == "systemone" {
+		return Outcome{}, &UpstreamError{Code: CodeServer,
+			Message: base + " is a System One decision model: it answers typed questions on /zen/v1/systemone, not chat requests"}, false
+	}
+
+	budget := BudgetFor(effort, *entry, req.MaxTokens, defMax)
+	messages := RepairToolPairing(req.Messages)
+	wire := entry.Wire
+	style := mapWireStyle(wire)
+
+	buildBody := func(msgs []Message, tools []ToolDef, maxTokens int) map[string]any {
+		body := map[string]any{"model": base, "stream": true}
+		switch wire {
+		case "responses":
+			instructions, items := ToResponseInput(msgs)
+			body["input"] = items
+			body["max_output_tokens"] = maxTokens
+			body["store"] = false
+			if instructions != "" {
+				body["instructions"] = instructions
+			}
+			if t := ToToolDefs(tools, style); t != nil {
+				body["tools"] = t
+			}
+		case "messages":
+			system, msgs := ToClaudeMessages(msgs)
+			body["messages"] = msgs
+			body["max_tokens"] = maxTokens
+			body["anthropic_version"] = "2023-06-01"
+			if system != "" {
+				body["system"] = system
+			}
+			if t := ToToolDefs(tools, style); t != nil {
+				body["tools"] = t
+			}
+		default:
+			body["messages"] = ToChatMessages(msgs)
+			body["max_tokens"] = maxTokens
+			if t := ToToolDefs(tools, style); t != nil {
+				body["tools"] = t
+			}
+		}
+		return body
+	}
+
+	session := SessionForConversation(req.SessionSeed)
+	requestID := RequestIdFor(session, req.TurnSeed)
+
+	body := buildBody(messages, req.Tools, budget)
+	rename := ApplyFingerprint(body, style)
+
+	decoder := NewDecoder(wire, rename, emit)
+	var firstAt int64
+	usage, err := PostStreamed(ctx, EndpointFor(base), body, session, requestID, func(p []byte) error {
+		if firstAt == 0 {
+			firstAt = time.Since(start).Milliseconds()
+		}
+		decoder.Decode(p)
+		return nil
+	})
+	result := decoder.Finish()
+	if usage != nil && result.Usage.TotalTokens == 0 {
+		result.Usage = *usage
+	}
+	sawAny := result.SawText || result.SawToolCall || result.SawReasoning
+	l.record(CallRecord{Model: base, Ok: false, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, result, err, firstAt)
+
+	if err != nil {
+		uerr := asUpstream(err)
+		if uerr.Code == CodeQuota {
+			l.MarkThrottled(base, uerr.RetryAfter)
+		}
+		return Outcome{Finish: result.Finish}, uerr, sawAny
+	}
+	if result.SawFinish {
+		l.MarkOK(base)
+		l.record(CallRecord{Model: base, Ok: true, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, result, nil, firstAt)
+		return Outcome{Usage: result.Usage, Finish: result.Finish}, nil, true
+	}
+
+	// Cut stream. Retry only a pure-reasoning cut that produced nothing else —
+	// a mid-content cut is a property of this turn's length, and re-sending
+	// would pay the same five minutes again.
+	elapsed := time.Since(start).Milliseconds()
+	if !canRecover(result, elapsed) {
+		l.record(CallRecord{Model: base, Ok: false, Truncated: true, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, result, nil, firstAt)
+		return Outcome{Usage: result.Usage}, &UpstreamError{Code: CodeTransport, Message: "upstream closed the stream without a finish token"}, sawAny
+	}
+
+	recovBudget := min2(RecoveryMaxOutputTokens, budget-result.Usage.Output)
+	if recovBudget < 512 || !checkpointFits(messages, *entry, result.ReasoningText, recovBudget) {
+		l.record(CallRecord{Model: base, Ok: false, Truncated: true, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, result, nil, firstAt)
+		return Outcome{Usage: result.Usage}, &UpstreamError{Code: CodeTransport, Message: "upstream cut a pure-reasoning turn; recovery does not fit the context"}, sawAny
+	}
+	recMsgs := append(append([]Message{}, messages...), Message{Role: RoleUser, Parts: []Part{
+		TextPart{Text: recoveryInstruction + jsonString(result.ReasoningText)},
+	}})
+	recBody := buildBody(recMsgs, nil, recovBudget)
+	ApplyFingerprint(recBody, style)
+	recDecoder := NewDecoder(wire, rename, emit)
+	remaining := RecoveryTotalTimeoutMS - elapsed
+	if remaining > RecoveryMaxContinuationMS {
+		remaining = RecoveryMaxContinuationMS
+	}
+	rctx, cancel := context.WithTimeout(ctx, time.Duration(remaining)*time.Millisecond)
+	defer cancel()
+
+	recUsage, rerr := PostStreamed(rctx, EndpointFor(base), recBody, session, RequestIdFor(session, req.TurnSeed+":recovery"), func(p []byte) error {
+		recDecoder.Decode(p)
+		return nil
+	})
+	recResult := recDecoder.Finish()
+	if recUsage != nil && recResult.Usage.TotalTokens == 0 {
+		recResult.Usage = *recUsage
+	}
+	if rerr == nil && recResult.SawFinish && recResult.Finish == FinishStop && recResult.SawText {
+		recResult.Usage.Merge(&result.Usage)
+		l.MarkOK(base)
+		l.record(CallRecord{Model: base, Ok: true, Recovered: true, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, recResult, nil, firstAt)
+		return Outcome{Usage: recResult.Usage, Finish: recResult.Finish, Recovered: true}, nil, true
+	}
+	recResult.Usage.Merge(&result.Usage)
+	l.record(CallRecord{Model: base, Ok: false, Truncated: true, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, recResult, rerr, firstAt)
+	if rerr != nil {
+		uerr := asUpstream(rerr)
+		if uerr.Code == CodeQuota {
+			l.MarkThrottled(base, uerr.RetryAfter)
+		}
+		return Outcome{Usage: recResult.Usage}, uerr, true
+	}
+	return Outcome{Usage: recResult.Usage}, &UpstreamError{Code: CodeTransport, Message: "upstream cut the stream; recovery did not complete"}, true
+}
+
+func (l *Lane) record(rec CallRecord, result StreamResult, err error, firstAt int64) {
+	if l.OnCall == nil {
+		return
+	}
+	if err != nil {
+		rec.Ok = false
+	} else {
+		rec.Ok = result.SawFinish
+	}
+	rec.Input = result.Usage.Input
+	rec.Output = result.Usage.Output
+	rec.Reasoning = result.Usage.Reasoning
+	rec.CacheRead = result.Usage.CacheRead
+	rec.TTFTMs = firstAt
+	if result.SawText {
+		rec.DecodeTok = WindowTokens(result.Usage, result.SawReasoning)
+	}
+	if !rec.Ok && err == nil {
+		rec.Truncated = true
+	}
+	if result.Usage.TotalTokens == 0 && err == nil && result.SawFinish {
+		rec.NoUsage = true
+	}
+	l.OnCall(rec)
+}
+
+func canRecover(result StreamResult, elapsedMS int64) bool {
+	return elapsedMS < RecoveryTotalTimeoutMS &&
+		!result.SawFinish &&
+		result.SawReasoning &&
+		!result.SawText &&
+		!result.SawToolCall &&
+		!result.CheckpointTruncated &&
+		nonWhitespace(result.ReasoningText)
+}
+
+func nonWhitespace(s string) bool {
+	for _, r := range s {
+		if r != ' ' && r != '\n' && r != '\r' && r != '\t' {
+			return true
+		}
+	}
+	return false
+}
+
+// checkpointFits is a conservative byte-based margin check, not a tokenizer.
+func checkpointFits(messages []Message, entry ModelInfo, checkpoint string, outputBudget int) bool {
+	ctx := entry.ContextWindow
+	if ctx <= 0 {
+		return true
+	}
+	if len(checkpoint) > (ctx-outputBudget)/2 {
+		return false
+	}
+	total := len(checkpoint) + outputBudget
+	for _, m := range messages {
+		total += len(m.TextOf())
+	}
+	return total < ctx
+}
+
+func mapWireStyle(wire string) string {
+	switch wire {
+	case "responses":
+		return "flat"
+	case "messages":
+		return "claude"
+	default:
+		return "chat"
+	}
+}
+
+func asUpstream(err error) *UpstreamError {
+	if err == nil {
+		return nil
+	}
+	if ue, ok := err.(*UpstreamError); ok {
+		return ue
+	}
+	return &UpstreamError{Code: CodeTransport, Message: err.Error()}
+}
+

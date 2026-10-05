@@ -1,0 +1,47 @@
+[Unit]
+Description=Zen Gate Server — OpenCode Zen 免费模型本地网关
+Documentation=https://github.com/LAGcomcom/zen-gate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 以专用低权限用户运行（先执行: sudo useradd -r -s /usr/sbin/nologin zen-gate）
+User=zen-gate
+Group=zen-gate
+
+# 二进制与数据目录（按实际安装路径调整）
+ExecStart=/usr/local/bin/zen-gate-server
+Environment=ZEN_GATE_HOME=/var/lib/zen-gate
+
+# 需要通过代理访问上游时，可解开下面一行（也可在 WebUI 设置里配）
+# Environment=HTTPS_PROXY=http://127.0.0.1:7890
+
+Restart=always
+RestartSec=3
+# 优雅退出：给足时间让探测循环与统计落盘收尾
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+# 日志进 journald：journalctl -u zen-gate-server -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zen-gate-server
+
+# --- 安全加固（按需放宽）---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+# 只有数据目录可写
+ReadWritePaths=/var/lib/zen-gate
+# 若使用 "跟随系统代理" 模式需要调用 gsettings，可解开并调整
+# PrivateDevices=false
+
+[Install]
+WantedBy=multi-user.target

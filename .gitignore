@@ -1,0 +1,20 @@
+# 构建产物
+/dist/
+*.exe
+*.test
+*.out
+
+# 运行时数据（配置/统计/日志，含 API Key，切勿提交）
+config.json
+stats.json
+quota.json
+perf.json
+logs/
+backups/
+data/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+*.swp
