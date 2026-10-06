@@ -46,6 +46,10 @@ type Config struct {
 	WebUIPassword        string `json:"webuiPassword,omitempty"` // empty → dashboard open to listeners only
 	MainKey              string `json:"mainKey"`
 	AgentKeys            map[string]string `json:"agentKeys"`
+	// ShareKeys are the hand-out keys (label → key). They are equivalent to
+	// the main key for auth, but usage is attributed per label so the
+	// 共享 page can show each recipient's own numbers.
+	ShareKeys            map[string]string `json:"shareKeys,omitempty"`
 	DefaultMaxTokens     int    `json:"defaultMaxTokens"`
 	DefaultEffort        string `json:"defaultEffort"`
 	ProbeIntervalMinutes int    `json:"probeIntervalMinutes"`
@@ -73,6 +77,15 @@ type DayStat struct {
 	Models    map[string]int `json:"models,omitempty"`
 	ModelReqs map[string]int `json:"modelReqs,omitempty"`
 	Agents    map[string]int `json:"agents,omitempty"`
+	Shares    map[string]ShareStat `json:"shares,omitempty"`
+}
+
+// ShareStat is one shared key's usage on a single day.
+type ShareStat struct {
+	Requests int `json:"requests"`
+	Failed   int `json:"failed"`
+	Input    int `json:"input"`
+	Output   int `json:"output"`
 }
 
 // Stats is the persisted usage accounting.
@@ -196,6 +209,9 @@ func Open() (*Store, error) {
 	if cfg.AgentKeys == nil {
 		cfg.AgentKeys = map[string]string{}
 	}
+	if cfg.ShareKeys == nil {
+		cfg.ShareKeys = map[string]string{}
+	}
 	if cfg.EnabledAgents == nil {
 		cfg.EnabledAgents = map[string]bool{}
 	}
@@ -301,6 +317,7 @@ func defaultConfig() Config {
 		Port:                 8787,
 		MainKey:              GenerateKey(""),
 		AgentKeys:            map[string]string{},
+		ShareKeys:            map[string]string{},
 		DefaultMaxTokens:     32768,
 		ProbeIntervalMinutes: 15,
 		ExposeRegion:         true,
@@ -316,6 +333,45 @@ func GenerateKey(prefix string) string {
 		return "ofm-" + prefix + "-" + base64.RawURLEncoding.EncodeToString(b)
 	}
 	return "ofm-" + base64.RawURLEncoding.EncodeToString(b)
+}
+
+// ShareAgentPrefix marks the usage label of a shared key inside CallRecord.
+const ShareAgentPrefix = "share:"
+
+// GenerateShareKey mints a hand-out key with its own prefix so a leaked key
+// is immediately recognisable as a shared one (rotatable without touching
+// the main key).
+func GenerateShareKey() string {
+	b := make([]byte, 24)
+	_, _ = rand.Read(b)
+	return "ofs-" + base64.RawURLEncoding.EncodeToString(b)
+}
+
+// CreateShareKey mints and stores a new shared key for one label.
+func (s *Store) CreateShareKey(label string) string {
+	s.mu.Lock()
+	if s.cfg.ShareKeys == nil {
+		s.cfg.ShareKeys = map[string]string{}
+	}
+	k := GenerateShareKey()
+	s.cfg.ShareKeys[label] = k
+	s.mu.Unlock()
+	_ = s.Save()
+	return k
+}
+
+// DeleteShareKey removes one shared key; it reports whether it existed.
+func (s *Store) DeleteShareKey(label string) bool {
+	s.mu.Lock()
+	_, ok := s.cfg.ShareKeys[label]
+	if ok {
+		delete(s.cfg.ShareKeys, label)
+	}
+	s.mu.Unlock()
+	if ok {
+		_ = s.Save()
+	}
+	return ok
 }
 
 // Config returns the live config (mutable via Save).
@@ -348,7 +404,7 @@ func (s *Store) Record(rec lane.CallRecord) {
 	day := time.UnixMilli(rec.At).Format("2006-01-02")
 	d, ok := s.stats.Days[day]
 	if !ok {
-		d = &DayStat{Models: map[string]int{}, Agents: map[string]int{}}
+		d = &DayStat{Models: map[string]int{}, Agents: map[string]int{}, Shares: map[string]ShareStat{}}
 		s.stats.Days[day] = d
 	}
 	d.Requests++
@@ -366,6 +422,19 @@ func (s *Store) Record(rec lane.CallRecord) {
 	}
 	if rec.Agent != "" {
 		d.Agents[rec.Agent] += rec.Output
+		if label, ok := strings.CutPrefix(rec.Agent, ShareAgentPrefix); ok {
+			if d.Shares == nil {
+				d.Shares = map[string]ShareStat{}
+			}
+			sh := d.Shares[label]
+			sh.Requests++
+			if !rec.Ok {
+				sh.Failed++
+			}
+			sh.Input += rec.Input
+			sh.Output += rec.Output
+			d.Shares[label] = sh
+		}
 	}
 	s.stats.Recent = append(s.stats.Recent, rec)
 	if len(s.stats.Recent) > maxRecent {

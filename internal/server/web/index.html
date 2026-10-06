@@ -173,6 +173,7 @@ pre{background:#0a0e14;border:1px solid var(--line);border-radius:10px;padding:1
     <button data-p="home" class="on">总览</button>
     <button data-p="models">模型</button>
     <button data-p="stats">统计</button>
+    <button data-p="share">共享</button>
     <button data-p="logs">日志</button>
     <button data-p="settings">设置</button>
     <button data-p="connect">接入</button>
@@ -236,6 +237,37 @@ pre{background:#0a0e14;border:1px solid var(--line);border-radius:10px;padding:1
     </div>
   </div>
   <div style="margin-top:14px"><button class="btn" onclick="location='/admin/api/usage.csv'">⬇ 导出 CSV</button></div>
+</div>
+
+<!-- 共享 -->
+<div class="page" id="p-share">
+  <div class="card" style="max-width:900px">
+    <h3>共享 Key</h3>
+    <div class="mut" style="margin-bottom:10px">生成一把发给别人的 Key。功能和主 Key 一样，但用量按这把 Key 单独记账，随时可轮换或收回。</div>
+    <div class="field">
+      <input id="shLabel" placeholder="备注名，例如：老王 / 团队A" style="max-width:280px">
+      <button class="btn pri" onclick="addSh()">生成共享 Key</button>
+      <span class="mut" id="shNote"></span>
+    </div>
+    <table style="margin-top:14px">
+      <thead><tr><th>备注</th><th>Key</th><th>今日请求</th><th>今日输出</th><th>累计输出</th><th>操作</th></tr></thead>
+      <tbody id="shareBody"><tr><td colspan="6" class="mut">加载中…</td></tr></tbody>
+    </table>
+  </div>
+
+  <div class="card" style="max-width:900px;margin-top:14px">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <h3 style="margin:0">用量明细</h3>
+      <div class="spacer"></div>
+      <span class="mut">选择共享 Key</span>
+      <select id="shPick" style="background:var(--bg);border:1px solid var(--line);color:var(--tx);border-radius:7px;padding:6px 10px"></select>
+    </div>
+    <div id="shChart" style="margin-top:12px"></div>
+    <div style="margin-top:10px;max-height:300px;overflow-y:auto">
+      <table><thead><tr><th>日期</th><th>请求</th><th>失败</th><th>输入 tokens</th><th>输出 tokens</th></tr></thead>
+      <tbody id="shDays"><tr><td colspan="5" class="mut">暂无数据</td></tr></tbody></table>
+    </div>
+  </div>
 </div>
 
 <!-- 日志 -->
@@ -399,6 +431,7 @@ document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{
   document.querySelectorAll("#tabs button").forEach(x=>x.classList.toggle("on",x===b));
   document.querySelectorAll(".page").forEach(p=>p.classList.toggle("on",p.id==="p-"+b.dataset.p));
   if(b.dataset.p==="stats")renderStats();
+  if(b.dataset.p==="share")renderShares();
   if(b.dataset.p==="logs")loadLogs();
 });
 
@@ -457,6 +490,7 @@ function applyState(){
   fillSettings();
   renderModels();
   renderConnect();
+  renderShares();
 }
 
 function renderRecent(){
@@ -567,6 +601,89 @@ function renderStats(){
   $("heatmap").innerHTML=d119.map(x=>'<span class="hm '+lv(x.output)+'" title="'+x.key+": "+fmt(x.output)+' tok / '+fmt(x.requests)+' 次"></span>').join("");
 }
 
+/* ---------- shared keys ---------- */
+let shShow={};
+function sharesObj(){return (S&&S.shareKeys)||{}}
+function shareOf(label,day){
+  const d=(S&&S.stats&&S.stats.days&&S.stats.days[day])||{};
+  return (d.shares||{})[label]||{requests:0,failed:0,input:0,output:0};
+}
+function shareTotal(label){
+  const days=(S&&S.stats&&S.stats.days)||{};
+  const t={requests:0,failed:0,input:0,output:0};
+  Object.keys(days).forEach(k=>{
+    const s=(days[k].shares||{})[label];
+    if(!s)return;
+    t.requests+=s.requests||0;t.failed+=s.failed||0;t.input+=s.input||0;t.output+=s.output||0;
+  });
+  return t;
+}
+function maskKey(k){return k?k.slice(0,7)+"…"+k.slice(-4):""}
+function arg(s){return esc(JSON.stringify(String(s)))}
+function toggleSh(l){shShow[l]=!shShow[l];renderShares()}
+function copySh(l){const k=sharesObj()[l];if(k)copyVal(k)}
+async function addSh(){
+  const label=$("shLabel").value.trim();
+  if(!label){toast("先填一个备注名");return}
+  try{
+    const j=await api("share/add",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({label})});
+    if(j.ok){$("shLabel").value="";shShow[j.label]=true;toast("已生成："+j.label);refreshState()}
+    else toast(j.error||"生成失败");
+  }catch(e){toast("生成失败")}
+}
+async function rotateSh(l){
+  if(!confirm("轮换「"+l+"」的 Key？旧 Key 立即失效，需要重新发给对方。"))return;
+  const j=await api("share/rotate",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({label:l})});
+  if(j.ok){shShow[l]=true;toast("已轮换");refreshState()}else toast(j.error||"轮换失败");
+}
+async function delSh(l){
+  if(!confirm("删除「"+l+"」？该 Key 立即失效，历史用量统计保留。"))return;
+  const j=await api("share/remove",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({label:l})});
+  if(j.ok){toast("已删除");refreshState()}else toast(j.error||"删除失败");
+}
+function renderShares(){
+  if(!S)return;
+  const sh=sharesObj();
+  const labels=Object.keys(sh).sort();
+  const tk=todayKey();
+  const tb=$("shareBody");
+  tb.innerHTML=labels.length?labels.map(l=>{
+    const k=sh[l],d=shareOf(l,tk),t=shareTotal(l);
+    return '<tr>'+
+      '<td>'+esc(l)+'</td>'+
+      '<td class="mono" style="word-break:break-all">'+(shShow[l]?esc(k):esc(maskKey(k)))+
+        ' <button class="btn" style="padding:1px 8px" onclick="toggleSh('+arg(l)+')">'+(shShow[l]?"隐藏":"显示")+'</button>'+
+        ' <button class="btn" style="padding:1px 8px" onclick="copySh('+arg(l)+')">复制</button></td>'+
+      '<td class="mono">'+fmt(d.requests)+"</td>"+
+      '<td class="mono">'+kfmt(d.output)+"</td>"+
+      '<td class="mono">'+kfmt(t.output)+"</td>"+
+      '<td><button class="btn" style="padding:1px 8px" onclick="rotateSh('+arg(l)+')">轮换</button> '+
+          '<button class="btn" style="padding:1px 8px" onclick="delSh('+arg(l)+')">删除</button></td>'+
+    "</tr>";
+  }).join(""):'<tr><td colspan="6" class="mut">还没有共享 Key，上面填个备注名生成一个吧</td></tr>';
+  renderShareUsage(labels);
+}
+function renderShareUsage(labels){
+  const sel=$("shPick");
+  if(!labels)labels=Object.keys(sharesObj()).sort();
+  const cur=sel.value;
+  sel.innerHTML=labels.length?labels.map(l=>'<option value="'+esc(l)+'">'+esc(l)+"</option>").join(""):'<option value="">（无）</option>';
+  if(cur&&labels.indexOf(cur)>=0)sel.value=cur;
+  const label=sel.value;
+  const days=(S&&S.stats&&S.stats.days)||{};
+  const out=[];const now=Date.now();
+  for(let i=13;i>=0;i--){
+    const t=new Date(now-i*86400000);
+    const key=t.getFullYear()+"-"+String(t.getMonth()+1).padStart(2,"0")+"-"+String(t.getDate()).padStart(2,"0");
+    const s=(days[key]&&days[key].shares&&days[key].shares[label])||{requests:0,failed:0,input:0,output:0};
+    out.push({key,requests:s.requests||0,failed:s.failed||0,input:s.input||0,output:s.output||0});
+  }
+  $("shChart").innerHTML=labels.length?barChart(out,"requests","#4f8ef7"):'<span class="mut">生成一把共享 Key 后，这里显示它每天被调用的次数。</span>';
+  const rows=out.slice().reverse();
+  $("shDays").innerHTML=labels.length?rows.map(x=>'<tr><td class="mono">'+x.key+"</td><td class=\"mono\">"+fmt(x.requests)+"</td><td class=\"mono\">"+fmt(x.failed)+
+    "</td><td class=\"mono\">"+fmt(x.input)+"</td><td class=\"mono\">"+fmt(x.output)+"</td></tr>").join(""):'<tr><td colspan="5" class="mut">暂无数据</td></tr>';
+}
+
 /* ---------- logs ---------- */
 async function loadLogs(){
   try{
@@ -581,6 +698,8 @@ async function loadLogs(){
   }catch(e){}
 }
 $("logLevel").onchange=loadLogs;
+$("shPick").onchange=()=>renderShareUsage();
+$("shLabel").addEventListener("keydown",e=>{if(e.key==="Enter")addSh()});
 setInterval(()=>{if(document.getElementById("p-logs").classList.contains("on")&&$("logAuto").checked)loadLogs()},3000);
 
 /* ---------- settings ---------- */

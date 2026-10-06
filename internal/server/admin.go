@@ -7,6 +7,7 @@ import (
 	_ "embed"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	neturl "net/url"
 
@@ -80,6 +82,12 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request, rest string
 			s.logger.Infof("主 API Key 已轮换")
 		}
 		writeJSON(w, 200, map[string]any{"ok": true, "key": s.Store.Config().MainKey})
+	case rest == "share/add" && r.Method == http.MethodPost:
+		s.adminShareAdd(w, r)
+	case rest == "share/rotate" && r.Method == http.MethodPost:
+		s.adminShareRotate(w, r)
+	case rest == "share/remove" && r.Method == http.MethodPost:
+		s.adminShareRemove(w, r)
 	case rest == "logout" && r.Method == http.MethodPost:
 		http.SetCookie(w, &http.Cookie{Name: "zg_session", Value: "", Path: "/",
 			MaxAge: -1, HttpOnly: true, SameSite: http.SameSiteLaxMode})
@@ -236,6 +244,7 @@ func (s *Server) adminState(w http.ResponseWriter) {
 		"listenHost":  cfg.ListenHost,
 		"mainKey":     cfg.MainKey,
 		"agentKeys":   cfg.AgentKeys,
+		"shareKeys":   cfg.ShareKeys,
 		"egress":      egress,
 		"models":      models,
 		"stats":       map[string]any{"days": days, "recent": recent},
@@ -581,6 +590,90 @@ func (s *Server) adminImport(w http.ResponseWriter, r *http.Request) {
 	_ = s.Store.Save()
 	if s.logger != nil {
 		s.logger.Infof("配置已导入；端口/监听地址保持不变")
+	}
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+// --- shared keys -------------------------------------------------------------
+
+// normShareLabel validates a hand-out key's label: non-empty, bounded, and
+// free of control characters (the label is a JSON map key and is echoed in
+// the dashboard).
+func normShareLabel(raw string) (string, error) {
+	label := strings.TrimSpace(raw)
+	if label == "" {
+		return "", errors.New("请填写备注名")
+	}
+	if utf8.RuneCountInString(label) > 24 {
+		return "", errors.New("备注名过长（最多 24 个字符）")
+	}
+	for _, r := range label {
+		if r < 0x20 || r == 0x7f {
+			return "", errors.New("备注名包含不可见字符")
+		}
+	}
+	return label, nil
+}
+
+func decodeShareLabel(r *http.Request) (string, error) {
+	var in struct {
+		Label string `json:"label"`
+	}
+	if err := decodeBody(r, &in); err != nil {
+		return "", err
+	}
+	return normShareLabel(in.Label)
+}
+
+// adminShareAdd mints one shared key for a new label.
+func (s *Server) adminShareAdd(w http.ResponseWriter, r *http.Request) {
+	label, err := decodeShareLabel(r)
+	if err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if _, exists := s.Store.Config().ShareKeys[label]; exists {
+		writeJSON(w, 409, map[string]any{"ok": false, "error": "该备注已存在，可直接轮换"})
+		return
+	}
+	key := s.Store.CreateShareKey(label)
+	if s.logger != nil {
+		s.logger.Infof("新增共享 Key：%s", label)
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "label": label, "key": key})
+}
+
+// adminShareRotate re-mints the key for an existing label (old key dies).
+func (s *Server) adminShareRotate(w http.ResponseWriter, r *http.Request) {
+	label, err := decodeShareLabel(r)
+	if err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if _, exists := s.Store.Config().ShareKeys[label]; !exists {
+		writeJSON(w, 404, map[string]any{"ok": false, "error": "没有这个共享 Key"})
+		return
+	}
+	key := s.Store.CreateShareKey(label)
+	if s.logger != nil {
+		s.logger.Infof("轮换共享 Key：%s", label)
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "label": label, "key": key})
+}
+
+// adminShareRemove revokes one shared key.
+func (s *Server) adminShareRemove(w http.ResponseWriter, r *http.Request) {
+	label, err := decodeShareLabel(r)
+	if err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if !s.Store.DeleteShareKey(label) {
+		writeJSON(w, 404, map[string]any{"ok": false, "error": "没有这个共享 Key"})
+		return
+	}
+	if s.logger != nil {
+		s.logger.Infof("删除共享 Key：%s", label)
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
 }

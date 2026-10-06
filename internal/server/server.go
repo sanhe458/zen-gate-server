@@ -240,6 +240,11 @@ func (s *Server) agentOf(r *http.Request) string {
 			return id
 		}
 	}
+	for label, k := range cfg.ShareKeys {
+		if k != "" && subtle.ConstantTimeCompare([]byte(key), []byte(k)) == 1 {
+			return store.ShareAgentPrefix + label
+		}
+	}
 	return ""
 }
 
@@ -249,6 +254,11 @@ func (s *Server) keyMatches(key string) bool {
 		return true
 	}
 	for _, k := range cfg.AgentKeys {
+		if k != "" && len(k) == len(key) && subtle.ConstantTimeCompare([]byte(key), []byte(k)) == 1 {
+			return true
+		}
+	}
+	for _, k := range cfg.ShareKeys {
 		if k != "" && len(k) == len(key) && subtle.ConstantTimeCompare([]byte(key), []byte(k)) == 1 {
 			return true
 		}
