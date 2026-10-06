@@ -203,7 +203,7 @@ func convertOpenAITools(in []openaiToolDef) []lane.ToolDef {
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var req openaiChatRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20)).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<20)).Decode(&req); err != nil {
 		writeJSON(w, 400, openaiError("invalid request body: "+err.Error(), "invalid_request_error"))
 		return
 	}
@@ -606,7 +606,7 @@ func convertResponsesInput(raw json.RawMessage, instructions string) []lane.Mess
 
 func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	var req responsesRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<20)).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<20)).Decode(&req); err != nil {
 		writeJSON(w, 400, openaiError("invalid request body: "+err.Error(), "invalid_request_error"))
 		return
 	}
