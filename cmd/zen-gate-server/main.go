@@ -15,7 +15,9 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -89,7 +91,74 @@ func main() {
 		}
 		st.SetQuotaNote(model, qn)
 	})
-	lane.SetProxy(cfg.ProxyMode, cfg.ProxyURL)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// --- 代理池 ------------------------------------------------------------
+	// The free lane accounts quota per IP: once the local connection is burned,
+	// another egress is the only way to keep serving. The pool starts on the
+	// direct line and rotates only when a quota refusal shows up.
+	pool := lane.NewProxyPool(func(f string, a ...any) { logger.Infof(f, a...) })
+	pool.SetStorage(filepath.Join(st.Home, "proxypool.json"))
+	if err := pool.Load(); err != nil && !os.IsNotExist(err) {
+		logger.Warnf("读取代理池快照失败: %v", err)
+	} else if n := pool.UsableCount(); n > 0 {
+		logger.Infof("已从上次快照恢复 %d 个可用代理（下次刷新会重新验证）", n)
+	}
+	pool.Configure(cfg.ProxyPoolSources, cfg.ProxyPoolMaxTest, cfg.ProxyPoolConcurrency,
+		cfg.ProxyPoolTimeoutSec, cfg.ProxyPoolVerifyUpstream)
+	if cfg.ProxyPoolEnabled {
+		lane.SetProxy("pool", "")
+		src, _, _, _, _ := pool.Config()
+		logger.Infof("代理池已启用：起始出口为本机直连，额度耗尽时自动切换（源 %d 个）", len(src))
+	} else {
+		lane.SetProxy(cfg.ProxyMode, cfg.ProxyURL)
+	}
+
+	// rotate debounce: one request can burn through several failover attempts,
+	// so a burst of 429s must still produce exactly one egress switch.
+	var lastRotate atomic.Int64
+	rotate := func(reason string) {
+		c := st.Config()
+		if !c.ProxyPoolEnabled || !c.ProxyPoolAutoRotate {
+			return
+		}
+		now := time.Now().UnixMilli()
+		prev := lastRotate.Load()
+		if now-prev < 20_000 { // 20s cooldown
+			return
+		}
+		if !lastRotate.CompareAndSwap(prev, now) {
+			return
+		}
+		go func() {
+			old := pool.Current()
+			url, err := pool.Rotate(ctx, true) // triggered by a quota refusal
+			if err != nil {
+				logger.Warnf("出口切换失败（%s）：%v", reason, err)
+				return
+			}
+			from := old
+			if from == "" {
+				from = "本机直连"
+			}
+			logger.Infof("因%s，出口 %s → %s", reason, from, url)
+			// quota is per IP: the new egress owes nothing, so every throttle
+			// verdict recorded on the old one is void
+			ln.ClearThrottle()
+			ln.ProbeRound(ctx, true)
+		}()
+	}
+
+	// quota refusal on live traffic
+	ln.OnQuotaExhausted = func(model string, retryAfter int) {
+		if !st.Config().ProxyPoolEnabled {
+			return
+		}
+		logger.Warnf("请求额度不足（%s，Retry-After %ds），尝试切换出口", model, retryAfter)
+		rotate("请求额度不足")
+	}
+
 	ln.OnCall = func(rec lane.CallRecord) {
 		st.Record(rec)
 		_ = st.FlushStats()
@@ -101,9 +170,7 @@ func main() {
 
 	gw := server.New(ln, st)
 	gw.SetLogger(logger)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	gw.SetProxyPool(pool)
 
 	stateText := func(s string) string {
 		return map[string]string{lane.StateAvailable: "可用", lane.StateUnknown: "未知",
@@ -113,6 +180,9 @@ func main() {
 	ln.OnProbeEdge = func(model, from, to string) {
 		if model == "" {
 			logger.Warnf("免费车道整轮 429 限额，探测进入指数退避")
+			// the whole-lane quota wall is the strongest signal that this IP
+			// has nothing left today
+			rotate("整轮探测额度耗尽")
 			return
 		}
 		logger.Infof("模型状态变化: %s %s → %s", model, stateText(from), stateText(to))
@@ -143,6 +213,38 @@ func main() {
 			case <-t.C:
 				_ = st.FlushStats()
 				st.FlushPerf()
+			}
+		}
+	}()
+
+	// proxy pool upkeep: a restored snapshot is already usable, so only refill
+	// when the supply is actually short. Rotation itself never blocks on this —
+	// it refills in place when it runs dry.
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(20 * time.Second):
+		}
+		check := func() {
+			c := st.Config()
+			if !c.ProxyPoolEnabled {
+				return
+			}
+			if n := pool.UsableCount(); n < c.ProxyPoolMinUsable {
+				logger.Infof("可用代理仅 %d 个（阈值 %d），补充代理池…", n, c.ProxyPoolMinUsable)
+				pool.Refresh(ctx)
+			}
+		}
+		check()
+		t := time.NewTicker(5 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				check()
 			}
 		}
 	}()

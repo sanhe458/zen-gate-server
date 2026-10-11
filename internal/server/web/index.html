@@ -172,6 +172,7 @@ pre{background:#0a0e14;border:1px solid var(--line);border-radius:10px;padding:1
   <nav id="tabs">
     <button data-p="home" class="on">总览</button>
     <button data-p="models">模型</button>
+    <button data-p="pool">代理池</button>
     <button data-p="stats">统计</button>
     <button data-p="share">共享</button>
     <button data-p="logs">日志</button>
@@ -283,6 +284,92 @@ pre{background:#0a0e14;border:1px solid var(--line);border-radius:10px;padding:1
     <button class="btn" onclick="loadLogs()">刷新</button>
   </div>
   <div id="logBox"></div>
+</div>
+
+<!-- 代理池 -->
+<div class="page" id="p-pool">
+  <div class="grid g4">
+    <div class="card stat"><h3>当前出口</h3><div class="v" style="font-size:16px;word-break:break-all" id="poolCur">–</div><div class="s" id="poolCurSub"></div></div>
+    <div class="card stat"><h3>可用代理</h3><div class="v" id="poolUsable">–</div><div class="s" id="poolUsableSub">低于阈值自动补充</div></div>
+    <div class="card stat"><h3>最近刷新</h3><div class="v" style="font-size:16px" id="poolLast">–</div><div class="s" id="poolLastSub"></div></div>
+    <div class="card stat"><h3>累计轮换</h3><div class="v" id="poolRot">–</div><div class="s" id="poolPassedSub"></div></div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <h3>为什么需要代理池</h3>
+    <div class="mut" style="line-height:1.9">
+      免费车道按 <b>IP</b> 计算每日额度。本机直连用完后，换一个出口 IP 即可继续使用。<br>
+      启用后：<b>先走本机直连</b> → 当某次请求出现额度不足，或每 <span id="poolProbeInt">15</span> 分钟探测中出现整轮限额时，
+      自动从池中挑选<b>延迟最低且已验证可用</b>的代理接替，并重置限额状态重新探测。<br>
+      池中代理全部来自公开免费列表，实测可用率约 1%～5%；连不通的、延迟过高的、IP 额度已耗尽的都不会被使用。
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <h3>代理池设置</h3>
+    <div class="form">
+      <label>启用代理池</label>
+      <div style="display:flex;gap:10px;align-items:center">
+        <label class="switch"><input type="checkbox" id="pfEnabled"><i></i></label>
+        <span class="mut">启用后代理模式转为「代理池」，起始为本机直连</span>
+      </div>
+      <label>额度不足自动切换</label>
+      <div style="display:flex;gap:10px;align-items:center">
+        <label class="switch"><input type="checkbox" id="pfAuto"><i></i></label>
+        <span class="mut">请求 429 或整轮探测限额时自动换出口（20 秒内只切一次）</span>
+      </div>
+      <label>最少可用代理数</label><input type="number" id="pfMin" min="1" max="50" style="width:120px">
+      <div class="hint">低于此数量时后台自动刷新补充</div>
+
+      <label>每轮测试上限</label><input type="number" id="pfMaxTest" min="50" max="20000" step="50" style="width:140px">
+      <div class="hint">每轮从源里随机抽取多少个候选做测速（越大越慢，但更可能找到可用节点）</div>
+      <label>测试并发数</label><input type="number" id="pfConc" min="1" max="500" style="width:140px">
+      <label>单代理超时（秒）</label><input type="number" id="pfTimeout" min="2" max="30" style="width:140px">
+      <label>验证上游</label>
+      <div style="display:flex;gap:10px;align-items:center">
+        <label class="switch"><input type="checkbox" id="pfVerify"><i></i></label>
+        <span class="mut">开启：要求代理能访问 zen 上游才算可用（准确）；关闭：仅测通用连通性（快，可能选到不可用的）</span>
+      </div>
+
+      <label>代理源</label>
+      <div class="full">
+        <textarea id="pfSources" rows="8" spellcheck="false"
+          style="width:100%;max-width:820px;background:var(--bg);border:1px solid var(--line);color:var(--tx);border-radius:7px;padding:9px 11px;font-family:var(--mono);font-size:12px;line-height:1.6"></textarea>
+        <div class="mut" style="margin-top:6px">每行一个纯文本代理列表地址（ip:port 或 scheme://ip:port）；留空则使用内置源</div>
+      </div>
+    </div>
+    <div class="savebar">
+      <button class="btn pri" onclick="savePool()">保存代理池设置</button>
+      <span class="note" id="poolSaveNote"></span>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <h3 style="margin:0">出口操作</h3>
+      <div class="spacer"></div>
+      <button class="btn" id="poolRefreshBtn" onclick="poolRefresh()">↻ 刷新代理池</button>
+      <button class="btn" onclick="poolRotate()">⇄ 立即切换出口</button>
+      <button class="btn" onclick="poolDirect()">⌂ 切回本机直连</button>
+    </div>
+    <div class="mut" style="margin-top:8px" id="poolActionNote"></div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <h3 style="margin:0">代理列表</h3>
+      <span class="mut" id="poolListMeta"></span>
+      <div class="spacer"></div>
+      <label class="switch" title="只看可用"><input type="checkbox" id="poolOnlyUsable" checked><i></i></label>
+      <span class="mut">只看可用</span>
+    </div>
+    <div style="max-height:520px;overflow-y:auto;margin-top:10px">
+      <table>
+        <thead><tr><th>代理地址</th><th>延迟</th><th>状态</th><th>出口</th><th>最近测试</th><th></th></tr></thead>
+        <tbody id="poolBody"><tr><td colspan="6" class="mut">尚未刷新代理池</td></tr></tbody>
+      </table>
+    </div>
+  </div>
 </div>
 
 <!-- 设置 -->
@@ -402,6 +489,7 @@ let S=null, pollTimer=null;
 const $=id=>document.getElementById(id);
 const fmt=n=>(n==null?"0":Number(n).toLocaleString("en-US"));
 const kfmt=n=>n>=1e6?(n/1e6).toFixed(1)+"M":n>=1e3?(n/1e3).toFixed(1)+"K":String(n||0);
+function ago(ts){if(!ts)return"";const s=(Date.now()-ts)/1000;if(s<60)return Math.floor(s)+" 秒前";if(s<3600)return Math.floor(s/60)+" 分钟前";if(s<86400)return Math.floor(s/3600)+" 小时前";return Math.floor(s/86400)+" 天前"}
 function toast(m){const t=$("toast");t.textContent=m;t.classList.add("show");setTimeout(()=>t.classList.remove("show"),2200)}
 function copyVal(v){if(navigator.clipboard){navigator.clipboard.writeText(v).then(()=>toast("已复制"),()=>{})}}
 function copyPre(btn){copyVal(btn.parentElement.querySelector("code").textContent)}
@@ -433,6 +521,7 @@ document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>{
   if(b.dataset.p==="stats")renderStats();
   if(b.dataset.p==="share")renderShares();
   if(b.dataset.p==="logs")loadLogs();
+  if(b.dataset.p==="pool"){poolFormFilled=false;fetchPool();}
 });
 
 /* ---------- boot & polling ---------- */
@@ -473,17 +562,20 @@ function applyState(){
   $("liveBadge").innerHTML='<span class="dot live"></span>运行中 · '+avail+' 模型可用';
   const eg=S.egress||{};
   const cntry=eg.country||"–";
-  if(cntry==="CN")$("egBadge").innerHTML='<span class="dot warn"></span>出口 CN — 部分模型可能被地区门拦截';
-  else $("egBadge").textContent="出口 "+(eg.ip||"–")+" · "+cntry;
+  const pp=S.proxyPool||{};
+  const viaProxy=pp.available&&pp.current;
+  const viaTag=viaProxy?' <span style="color:var(--acc)">· 经由代理</span>':'';
+  if(cntry==="CN")$("egBadge").innerHTML='<span class="dot warn"></span>出口 CN — 部分模型可能被地区门拦截'+viaTag;
+  else $("egBadge").innerHTML='出口 '+(eg.ip||"–")+" · "+cntry+viaTag;
   $("uptimeBadge").textContent="已运行 "+(S.uptime||"");
   $("verBadge").textContent="v"+S.version;
   $("iListen").textContent=S.listenAddr+(S.loopback?"（仅本机）":"（局域网）");
-  $("iEgress").textContent=(eg.ip||"–")+" · "+cntry;
+  $("iEgress").textContent=(eg.ip||"–")+" · "+cntry+(viaProxy?'（代理）':"");
   $("iVer").textContent="v"+S.version;
   $("iStart").textContent=S.startedAt;
   $("iData").textContent=S.dataDir;
   $("iPid").textContent=S.pid;
-  $("iProxy").textContent=({env:"环境变量",direct:"直连",system:"系统代理",custom:"自定义"})[S.settings.proxyMode]||S.settings.proxyMode;
+  $("iProxy").textContent=(S.proxyPool&&S.proxyPool.available&&S.proxyPool.enabled)?"代理池":(({env:"环境变量",direct:"直连",system:"系统代理",custom:"自定义"})[S.settings.proxyMode]||S.settings.proxyMode);
   $("iProbe").textContent="每 "+S.settings.probeIntervalMinutes+" 分钟";
   $("probeInt").textContent=S.settings.probeIntervalMinutes;
   renderRecent();
@@ -779,6 +871,151 @@ function renderConnect(){
   const rows=(S.models||[]).map(x=>'<tr><td class="mono">'+esc(x.id)+"</td><td>"+esc(x.name)+'</td><td class="mut">'+[x.reasoning?"推理":"",x.vision?"视觉":""].filter(Boolean).join(" · ")+"</td><td>"+kfmt(x.contextWindow)+" / "+kfmt(x.maxOutput)+'</td><td><span class="st '+(stateCls[x.state]||"uk")+'">'+(stateTxt[x.state]||x.state)+"</span></td></tr>").join("");
   $("modelRef").innerHTML=rows||'<tr><td colspan="5" class="mut">模型目录尚未加载…</td></tr>';
 }
+
+/* ---------- proxy pool ---------- */
+let POOL=null, poolFormFilled=false;
+
+async function fetchPool(){
+  try{
+    POOL=await api("pool");
+    if(!POOL||!POOL.available){
+      $("poolBody").innerHTML='<tr><td colspan="6" class="mut">代理池不可用</td></tr>';
+      return;
+    }
+    renderPoolStats();
+    renderPoolTable();
+    if(!poolFormFilled){ fillPoolForm(); poolFormFilled=true; }
+  }catch(e){}
+}
+
+function renderPoolStats(){
+  if(!POOL)return;
+  const cur=POOL.current||"";
+  $("poolCur").textContent=cur||"本机直连";
+  $("poolCur").style.color=cur?"var(--acc)":"var(--tx)";
+  $("poolCurSub").textContent=cur?(POOL.enabled?"代理出口 · 已启用代理池":"代理出口 · 代理池已关闭"):"未使用代理（本机 IP）";
+  $("poolUsable").textContent=POOL.usable??0;
+  $("poolUsableSub").textContent="少于 "+(POOL.minUsable??3)+" 个时自动补充";
+  $("poolLast").textContent=POOL.lastAt?new Date(POOL.lastAt).toLocaleString("zh-CN",{hour12:false}):"从未刷新";
+  $("poolLastSub").textContent=POOL.refreshing?"正在刷新中…":"测试 "+(POOL.stats?.tested??0)+" 个";
+  $("poolRot").textContent=POOL.stats?.rotations??0;
+  $("poolPassedSub").textContent="可用 "+(POOL.stats?.passed??0)+" · 额度耗尽 "+(POOL.stats?.exhausted??0);
+  $("poolListMeta").textContent="共 "+(POOL.total??0)+" 个"+(POOL.total>(POOL.shown??0)?"（显示前 "+POOL.shown+" 个）":"");
+  if(POOL.lastError)$("poolActionNote").textContent="最近错误：" + POOL.lastError;
+  const btn=$("poolRefreshBtn");
+  if(btn){btn.disabled=!!POOL.refreshing;btn.textContent=POOL.refreshing?"刷新中…":"↻ 刷新代理池"}
+}
+
+function renderPoolTable(){
+  if(!POOL)return;
+  const onlyUsable=$("poolOnlyUsable").checked;
+  let list=POOL.entries||[];
+  if(onlyUsable)list=list.filter(e=>e.ok&&!e.exhausted);
+  const tb=$("poolBody");
+  if(!list.length){
+    tb.innerHTML='<tr><td colspan="6" class="mut">'+(onlyUsable?"暂无可用的代理节点，点上面「刷新代理池」重新抓取":"暂无数据")+'</td></tr>';
+    return;
+  }
+  tb.innerHTML=list.map(e=>{
+    let st,cls;
+    if(!e.ok){st="不可用";cls="uk"}
+    else if(e.exhausted){st="额度耗尽";cls="th"}
+    else {st="可用";cls="av"}
+    const isCur=(POOL.current&&e.url===POOL.current);
+    return '<tr>'+
+      '<td class="mono">'+esc(e.url)+(isCur?' <span class="pill" style="color:var(--acc)">当前</span>':'')+'</td>'+
+      '<td class="mono">'+(e.latencyMs?e.latencyMs+" ms":"–")+'</td>'+
+      '<td><span class="st '+cls+'">'+st+'</span></td>'+
+      '<td class="mut">'+esc(e.country||e.detail||"")+'</td>'+
+      '<td class="mut">'+(e.lastTest?ago(e.lastTest):"–")+'</td>'+
+      '<td>'+(e.ok&&!e.exhausted?'<button class="btn" data-u="'+esc(e.url)+'" onclick="poolUse(this)">使用</button>':"")+'</td>'+
+    '</tr>';
+  }).join("");
+}
+
+function fillPoolForm(){
+  if(!POOL||!S)return;
+  const st=S.settings||{};
+  $("pfEnabled").checked=!!POOL.enabled;
+  $("pfAuto").checked=!!POOL.autoRotate;
+  $("pfMin").value=POOL.minUsable??3;
+  $("pfMaxTest").value=POOL.maxTest??1500;
+  $("pfConc").value=POOL.concurrency??120;
+  $("pfTimeout").value=POOL.timeoutSec??6;
+  $("pfVerify").checked=!!POOL.verifyUpstream;
+  $("pfSources").value=(POOL.sources||[]).join("\n");
+  $("poolProbeInt").textContent=st.probeIntervalMinutes||15;
+}
+
+async function savePool(){
+  const body={
+    proxyPoolEnabled:$("pfEnabled").checked,
+    proxyPoolAutoRotate:$("pfAuto").checked,
+    proxyPoolMinUsable:+$("pfMin").value||undefined,
+    proxyPoolMaxTest:+$("pfMaxTest").value||undefined,
+    proxyPoolConcurrency:+$("pfConc").value||undefined,
+    proxyPoolTimeoutSec:+$("pfTimeout").value||undefined,
+    proxyPoolVerifyUpstream:$("pfVerify").checked,
+    proxyPoolSources:$("pfSources").value.split("\n").map(x=>x.trim()).filter(Boolean)
+  };
+  $("poolSaveNote").textContent="保存中…";
+  try{
+    const j=await api("settings",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
+    $("poolSaveNote").textContent=j.ok?"已保存":"未改动";
+    toast("代理池设置已保存");
+    poolFormFilled=false;
+    await fetchPool();
+    refreshState();
+  }catch(e){$("poolSaveNote").textContent="保存失败"}
+}
+
+async function poolRefresh(){
+  $("poolActionNote").textContent="已开始刷新：抓取代理源并逐个测速，约需 1 分钟…";
+  try{
+    await api("pool/refresh",{method:"POST"});
+    toast("已开始刷新代理池");
+    setTimeout(fetchPool,1500);
+  }catch(e){$("poolActionNote").textContent="刷新请求失败"}
+}
+
+async function poolRotate(){
+  $("poolActionNote").textContent="正在切换出口…";
+  try{
+    const j=await api("pool/rotate",{method:"POST"});
+    if(j.ok){ $("poolActionNote").textContent="已切换到 "+(j.current||"?"); toast("出口已切换") }
+    else $("poolActionNote").textContent="切换失败："+(j.error||"");
+    await fetchPool();
+    refreshState();
+  }catch(e){$("poolActionNote").textContent="切换失败"}
+}
+
+async function poolDirect(){
+  $("poolActionNote").textContent="正在切回本机直连…";
+  try{
+    await api("pool/use",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({url:""})});
+    $("poolActionNote").textContent="已切回本机直连";
+    toast("已切回本机直连");
+    await fetchPool();
+    refreshState();
+  }catch(e){$("poolActionNote").textContent="操作失败"}
+}
+
+async function poolUse(btn){
+  const url=btn.dataset.u;
+  $("poolActionNote").textContent="正在切换到 "+url+"…";
+  try{
+    const j=await api("pool/use",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({url})});
+    if(j.ok){$("poolActionNote").textContent="已使用 "+url;toast("已切换出口")}
+    else $("poolActionNote").textContent="失败："+(j.error||"");
+    await fetchPool();
+    refreshState();
+  }catch(e){$("poolActionNote").textContent="操作失败"}
+}
+
+$("poolOnlyUsable").onchange=renderPoolTable;
+
+// poll the pool view while it is on screen (progress during a refresh)
+setInterval(()=>{if(document.getElementById("p-pool").classList.contains("on"))fetchPool()},5000);
 
 boot();
 </script>

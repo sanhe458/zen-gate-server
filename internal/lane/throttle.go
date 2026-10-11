@@ -28,8 +28,8 @@ type ThrottleNote struct {
 }
 
 const (
-	throttleCooldownDefault = 60 * 1000        // 1 min when upstream gave no Retry-After
-	throttleCooldownMax     = 2 * 3600 * 1000  // 2 h cap — probes will re-verify
+	throttleCooldownDefault = 60 * 1000       // 1 min when upstream gave no Retry-After
+	throttleCooldownMax     = 2 * 3600 * 1000 // 2 h cap — probes will re-verify
 	throttleEpisodeTTL      = 14 * 24 * 3600 * 1000
 	throttleMaxEpisodes     = 12
 )
@@ -54,6 +54,34 @@ func (b *ThrottleBook) Load(notes map[string]ThrottleNote) {
 	for m, n := range notes {
 		cp := n
 		b.notes[m] = &cp
+	}
+}
+
+// Clear drops every model's throttle state while keeping the episode history
+// minus its open episode. Quota is accounted per egress, so moving to a fresh
+// IP invalidates the current cooldowns — but the historical episodes stay
+// useful for the daily-quota estimate.
+func (b *ThrottleBook) Clear() {
+	now := time.Now().UnixMilli()
+	b.mu.Lock()
+	changed := make(map[string]ThrottleNote, len(b.notes))
+	for m, n := range b.notes {
+		if n.ThrottledAt == 0 {
+			continue
+		}
+		// close an open episode so the estimate keeps its length data
+		for i := range n.Episodes {
+			if n.Episodes[i].End == 0 {
+				n.Episodes[i].End = now
+			}
+		}
+		n.ThrottledAt = 0
+		n.CooldownUntil = 0
+		changed[m] = *n
+	}
+	b.mu.Unlock()
+	for m, n := range changed { // fire outside the lock, matching MarkOK
+		b.fire(m, n)
 	}
 }
 

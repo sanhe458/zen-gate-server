@@ -31,21 +31,21 @@ const recoveryInstruction = "The previous response was interrupted before its fi
 
 // CallRecord is emitted after every upstream request (physical, not logical).
 type CallRecord struct {
-	Model      string `json:"model"`
-	Agent      string `json:"agent,omitempty"`
-	Ok         bool   `json:"ok"`
-	Truncated  bool   `json:"truncated,omitempty"`
-	NoUsage    bool   `json:"noUsage,omitempty"`
-	Recovered  bool   `json:"recovered,omitempty"`
-	Input      int    `json:"input"`
-	Output     int    `json:"output"`
-	Reasoning  int    `json:"reasoning,omitempty"`
-	CacheRead  int    `json:"cacheRead,omitempty"`
-	TTFTMs     int64  `json:"ttftMs,omitempty"`
-	DecodeMs   int64  `json:"decodeMs,omitempty"`
-	DecodeTok  int    `json:"decodeTokens,omitempty"`
-	Effort     string `json:"effort,omitempty"`
-	At         int64  `json:"at"`
+	Model     string `json:"model"`
+	Agent     string `json:"agent,omitempty"`
+	Ok        bool   `json:"ok"`
+	Truncated bool   `json:"truncated,omitempty"`
+	NoUsage   bool   `json:"noUsage,omitempty"`
+	Recovered bool   `json:"recovered,omitempty"`
+	Input     int    `json:"input"`
+	Output    int    `json:"output"`
+	Reasoning int    `json:"reasoning,omitempty"`
+	CacheRead int    `json:"cacheRead,omitempty"`
+	TTFTMs    int64  `json:"ttftMs,omitempty"`
+	DecodeMs  int64  `json:"decodeMs,omitempty"`
+	DecodeTok int    `json:"decodeTokens,omitempty"`
+	Effort    string `json:"effort,omitempty"`
+	At        int64  `json:"at"`
 }
 
 // Lane orchestrates the free lane: catalog, availability, and completion calls.
@@ -60,10 +60,10 @@ type Lane struct {
 	failoverMax      int
 	throttle         *ThrottleBook
 
-	probing        atomicFlag
-	lastProbeAt    time.Time
-	backoffRounds  int
-	nextProbeAfter time.Time
+	probing         atomicFlag
+	lastProbeAt     time.Time
+	backoffRounds   int
+	nextProbeAfter  time.Time
 	quotaWallActive bool
 	probingModel    string
 
@@ -77,6 +77,11 @@ type Lane struct {
 	// OnProbeResult fires after each individual model probe finished — main
 	// uses it to feed the per-model first-token sample history.
 	OnProbeResult func(ProbeResult)
+	// OnQuotaExhausted fires when a live request was refused with a quota
+	// error (429). The proxy pool listens here to rotate the egress: the free
+	// lane accounts quota per IP, so a fresh IP restores service.
+	// model is the id that was refused, retryAfter the upstream hint (sec).
+	OnQuotaExhausted func(model string, retryAfter int)
 }
 
 type atomicFlag struct{ v int32 }
@@ -153,6 +158,26 @@ func (l *Lane) fireChange() {
 	if l.OnChange != nil {
 		go l.OnChange()
 	}
+}
+
+// ClearThrottle forgets every throttle verdict and quota backoff. Called after
+// switching egress: quota is accounted per IP, so the cooldowns recorded on
+// the old connection say nothing about the new one. Models fall back to
+// "unknown" and the next probe round re-verifies them.
+func (l *Lane) ClearThrottle() {
+	l.throttle.Clear()
+	l.mu.Lock()
+	for id, r := range l.availability {
+		if r.State == StateThrottled {
+			l.availability[id] = ProbeResult{Model: id, State: StateUnknown,
+				At: time.Now().UnixMilli(), Detail: "已切换出口，等待重新探测"}
+		}
+	}
+	l.quotaWallActive = false
+	l.backoffRounds = 0
+	l.nextProbeAfter = time.Time{}
+	l.mu.Unlock()
+	l.fireChange()
 }
 
 // ThrottleNotes snapshots the ledger for /state.
@@ -452,6 +477,14 @@ func (l *Lane) Complete(ctx context.Context, req Request, emit func(Chunk)) (Out
 		out.Failovers = failovers
 		if uerr == nil {
 			return out, nil
+		}
+		// Quota refusal on live traffic: the pool may want to move egress.
+		// Fired on every 429 (before the failover decision) so a whole-lane
+		// quota wall is reported even when model failover papers over it.
+		if uerr.Code == CodeQuota {
+			if hook := l.OnQuotaExhausted; hook != nil {
+				go hook(model, uerr.RetryAfter)
+			}
 		}
 		// No switch after content reached the caller (it would duplicate
 		// output), on egress-wide failures, or once the attempt budget is out.
@@ -763,4 +796,3 @@ func asUpstream(err error) *UpstreamError {
 	}
 	return &UpstreamError{Code: CodeTransport, Message: err.Error()}
 }
-

@@ -65,7 +65,31 @@ type Config struct {
 	ProxyURL             string `json:"proxyUrl,omitempty"`
 	FailoverEnabled      bool   `json:"failoverEnabled"`
 	FailoverMax          int    `json:"failoverMax"`
-	Window               WindowState `json:"window"`
+
+	// --- proxy pool: quota is accounted per IP, so a fresh egress restores
+	// service once the local one is burned. ---
+	// ProxyPoolEnabled turns the whole feature on (lane switches to "pool"
+	// proxy mode, starting on the direct connection).
+	ProxyPoolEnabled bool `json:"proxyPoolEnabled"`
+	// ProxyPoolAutoRotate moves to the next best proxy automatically when a
+	// quota refusal is seen (live request 429 or an all-throttled probe round).
+	ProxyPoolAutoRotate bool `json:"proxyPoolAutoRotate"`
+	// ProxyPoolSources are the listing URLs; empty → built-in defaults.
+	ProxyPoolSources []string `json:"proxyPoolSources,omitempty"`
+	// ProxyPoolMaxTest caps how many candidates are probed per refresh.
+	ProxyPoolMaxTest int `json:"proxyPoolMaxTest,omitempty"`
+	// ProxyPoolConcurrency is the parallel probe width.
+	ProxyPoolConcurrency int `json:"proxyPoolConcurrency,omitempty"`
+	// ProxyPoolTimeoutSec is the per-candidate probe timeout.
+	ProxyPoolTimeoutSec int `json:"proxyPoolTimeoutSec,omitempty"`
+	// ProxyPoolVerifyUpstream requires a proxy to answer the upstream listing
+	// (slower, precise) instead of a generic connectivity check (fast, loose).
+	ProxyPoolVerifyUpstream bool `json:"proxyPoolVerifyUpstream"`
+	// ProxyPoolMinUsable triggers a background refresh when the usable count
+	// drops below it.
+	ProxyPoolMinUsable int `json:"proxyPoolMinUsable,omitempty"`
+
+	Window WindowState `json:"window"`
 }
 
 // DayStat aggregates one calendar day.
@@ -249,6 +273,32 @@ func Open() (*Store, error) {
 		b := make([]byte, 12)
 		_, _ = rand.Read(b)
 		cfg.InstallID = hex.EncodeToString(b)
+	}
+	// v4: proxy pool. Quota is accounted per IP, so rotating the egress is the
+	// escape hatch once the local connection is burned. Ships with workable
+	// numbers and the built-in source list; the feature stays off until the
+	// user enables it (and even then the lane starts on the direct line).
+	if cfg.SchemaVersion < 4 {
+		cfg.SchemaVersion = 4
+		cfg.ProxyPoolAutoRotate = true
+		cfg.ProxyPoolMaxTest = 1500
+		cfg.ProxyPoolConcurrency = 120
+		cfg.ProxyPoolTimeoutSec = 6
+		cfg.ProxyPoolVerifyUpstream = true
+		cfg.ProxyPoolMinUsable = 3
+	}
+	// keep the pool numbers sane even if a hand-edited config zeroed them
+	if cfg.ProxyPoolMaxTest <= 0 {
+		cfg.ProxyPoolMaxTest = 1500
+	}
+	if cfg.ProxyPoolConcurrency <= 0 {
+		cfg.ProxyPoolConcurrency = 120
+	}
+	if cfg.ProxyPoolTimeoutSec <= 0 {
+		cfg.ProxyPoolTimeoutSec = 6
+	}
+	if cfg.ProxyPoolMinUsable <= 0 {
+		cfg.ProxyPoolMinUsable = 3
 	}
 	if cfg.SchemaVersion == 0 {
 		// first migration to the versioned schema: mature defaults

@@ -7,8 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	io "io"
-	neturl "net/url"
 	"net/http"
+	neturl "net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -18,8 +18,8 @@ import (
 )
 
 var (
-	regionRe  = regexp.MustCompile(`(?i)RegionError|not available in your country|region.?block`)
-	quotaRe   = regexp.MustCompile(`(?i)FreeUsageLimitError|usage limit|rate limit`)
+	regionRe   = regexp.MustCompile(`(?i)RegionError|not available in your country|region.?block`)
+	quotaRe    = regexp.MustCompile(`(?i)FreeUsageLimitError|usage limit|rate limit`)
 	modelErrRe = regexp.MustCompile(`(?i)ModelError|model is unavailable|model is not supported|not supported|Endpoint is unavailable`)
 )
 
@@ -54,9 +54,22 @@ func ClassifyFailure(status int, payload string, retryAfterSec int) *UpstreamErr
 // Transport when the proxy setting changes (hot, no restart).
 var laneHTTP = &http.Client{}
 
+// dynamicProxy is the proxy selected by the pool at runtime. In "pool" mode
+// the transport consults it on every request, so switching egress costs
+// nothing — no transport rebuild, no dropped connections.
+// nil = direct (the pool always starts on the local connection).
+var dynamicProxy atomic.Pointer[neturl.URL]
+
+// SetActiveProxy installs the egress the pool currently wants to use.
+// nil selects the local (direct) connection.
+func SetActiveProxy(u *neturl.URL) { dynamicProxy.Store(u) }
+
+// ActiveProxy returns the pool-selected proxy, or nil for direct.
+func ActiveProxy() *neturl.URL { return dynamicProxy.Load() }
+
 // SetProxy reconfigures the shared client: "env" honors HTTP(S)_PROXY,
-// "system" follows the Windows system proxy (WinINET settings), "direct"
-// bypasses, "custom" uses the given URL.
+// "system" follows the desktop system proxy, "direct" bypasses, "custom" uses
+// the given URL, "pool" defers to whatever the proxy pool selected.
 func SetProxy(mode, url string) {
 	t := &http.Transport{}
 	switch mode {
@@ -71,6 +84,8 @@ func SetProxy(mode, url string) {
 		}
 	case "system":
 		t.Proxy = func(*http.Request) (*neturl.URL, error) { return SystemProxyURL(), nil }
+	case "pool":
+		t.Proxy = func(*http.Request) (*neturl.URL, error) { return dynamicProxy.Load(), nil }
 	default:
 		t.Proxy = http.ProxyFromEnvironment
 	}

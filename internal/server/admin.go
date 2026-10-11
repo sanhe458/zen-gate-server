@@ -1,11 +1,12 @@
 package server
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
-	"encoding/hex"
 	_ "embed"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -94,6 +95,14 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request, rest string
 		writeJSON(w, 200, map[string]any{"ok": true})
 	case rest == "proxy-test" && r.Method == http.MethodPost:
 		s.adminProxyTest(w, r)
+	case rest == "pool" && r.Method == http.MethodGet:
+		s.adminPoolState(w)
+	case rest == "pool/refresh" && r.Method == http.MethodPost:
+		s.adminPoolRefresh(w, r)
+	case rest == "pool/rotate" && r.Method == http.MethodPost:
+		s.adminPoolRotate(w, r)
+	case rest == "pool/use" && r.Method == http.MethodPost:
+		s.adminPoolUse(w, r)
 	case rest == "logs" && r.Method == http.MethodGet:
 		s.adminLogs(w, r)
 	case rest == "usage.csv" && r.Method == http.MethodGet:
@@ -260,7 +269,11 @@ func (s *Server) adminState(w http.ResponseWriter) {
 			"failoverMax":          cfg.FailoverMax,
 			"listenHost":           cfg.ListenHost,
 			"hasPassword":          strings.TrimSpace(cfg.WebUIPassword) != "",
+			"proxyPoolEnabled":     cfg.ProxyPoolEnabled,
+			"proxyPoolAutoRotate":  cfg.ProxyPoolAutoRotate,
+			"proxyPoolMinUsable":   cfg.ProxyPoolMinUsable,
 		},
+		"proxyPool":    s.poolSummary(),
 		"probingModel": s.Lane.ProbingModel(),
 		"version":      Version,
 		"startedAt":    startedAt.Format("2006-01-02 15:04:05"),
@@ -326,6 +339,15 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 		ProxyURL             *string `json:"proxyUrl"`
 		FailoverEnabled      *bool   `json:"failoverEnabled"`
 		FailoverMax          *int    `json:"failoverMax"`
+		// proxy pool
+		ProxyPoolEnabled        *bool    `json:"proxyPoolEnabled"`
+		ProxyPoolAutoRotate     *bool    `json:"proxyPoolAutoRotate"`
+		ProxyPoolSources        []string `json:"proxyPoolSources"`
+		ProxyPoolMaxTest        *int     `json:"proxyPoolMaxTest"`
+		ProxyPoolConcurrency    *int     `json:"proxyPoolConcurrency"`
+		ProxyPoolTimeoutSec     *int     `json:"proxyPoolTimeoutSec"`
+		ProxyPoolVerifyUpstream *bool    `json:"proxyPoolVerifyUpstream"`
+		ProxyPoolMinUsable      *int     `json:"proxyPoolMinUsable"`
 	}
 	if err := decodeBody(r, &in); err != nil {
 		writeJSON(w, 400, map[string]any{"error": err.Error()})
@@ -411,6 +433,60 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 		cfg.FailoverMax = *in.FailoverMax
 		s.Lane.SetFailover(cfg.FailoverEnabled, cfg.FailoverMax)
 		changed = true
+	}
+
+	// --- proxy pool ---
+	poolTouched := false
+	if in.ProxyPoolEnabled != nil && *in.ProxyPoolEnabled != cfg.ProxyPoolEnabled {
+		cfg.ProxyPoolEnabled = *in.ProxyPoolEnabled
+		changed, poolTouched = true, true
+	}
+	if in.ProxyPoolAutoRotate != nil {
+		cfg.ProxyPoolAutoRotate = *in.ProxyPoolAutoRotate
+		changed = true
+	}
+	if in.ProxyPoolSources != nil {
+		clean := []string{}
+		for _, s := range in.ProxyPoolSources {
+			if t := strings.TrimSpace(s); t != "" {
+				clean = append(clean, t)
+			}
+		}
+		cfg.ProxyPoolSources = clean
+		changed, poolTouched = true, true
+	}
+	if in.ProxyPoolMaxTest != nil && *in.ProxyPoolMaxTest > 0 {
+		cfg.ProxyPoolMaxTest = *in.ProxyPoolMaxTest
+		changed, poolTouched = true, true
+	}
+	if in.ProxyPoolConcurrency != nil && *in.ProxyPoolConcurrency > 0 {
+		cfg.ProxyPoolConcurrency = *in.ProxyPoolConcurrency
+		changed, poolTouched = true, true
+	}
+	if in.ProxyPoolTimeoutSec != nil && *in.ProxyPoolTimeoutSec > 0 {
+		cfg.ProxyPoolTimeoutSec = *in.ProxyPoolTimeoutSec
+		changed, poolTouched = true, true
+	}
+	if in.ProxyPoolVerifyUpstream != nil {
+		cfg.ProxyPoolVerifyUpstream = *in.ProxyPoolVerifyUpstream
+		changed, poolTouched = true, true
+	}
+	if in.ProxyPoolMinUsable != nil && *in.ProxyPoolMinUsable > 0 {
+		cfg.ProxyPoolMinUsable = *in.ProxyPoolMinUsable
+		changed = true
+	}
+	if s.pool != nil && poolTouched {
+		s.pool.Configure(cfg.ProxyPoolSources, cfg.ProxyPoolMaxTest, cfg.ProxyPoolConcurrency,
+			cfg.ProxyPoolTimeoutSec, cfg.ProxyPoolVerifyUpstream)
+	}
+	if s.pool != nil && in.ProxyPoolEnabled != nil {
+		// flipping the switch also swaps the transport's proxy mode
+		if cfg.ProxyPoolEnabled {
+			lane.SetProxy("pool", "")
+		} else {
+			lane.SetActiveProxy(nil)
+			lane.SetProxy(cfg.ProxyMode, cfg.ProxyURL)
+		}
 	}
 	if changed {
 		_ = s.Store.Save()
@@ -692,4 +768,143 @@ func (s *Server) adminProbeOne(w http.ResponseWriter, model string) {
 		s.logger.Infof("手动探测 %s → %s (首字 %dms)", model, res.State, res.TTFTMs)
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "result": res})
+}
+
+// --- proxy pool ---------------------------------------------------------------
+
+// adminPoolState is the dashboard view of the egress pool. The entry list is
+// capped: a full run can hold thousands of dead candidates and the UI only
+// ever shows the usable head plus a failure sample.
+func (s *Server) adminPoolState(w http.ResponseWriter) {
+	if s.pool == nil {
+		writeJSON(w, 200, map[string]any{"available": false})
+		return
+	}
+	cur, entries, refreshing, stats, lastAt, lastErr := s.pool.Snapshot()
+	sources, maxTest, conc, timeoutSec, verify := s.pool.Config()
+	cfg := s.Store.Config()
+
+	usable := 0
+	for _, e := range entries {
+		if e.OK && !e.Exhausted {
+			usable++
+		}
+	}
+	const limit = 300
+	capped := entries
+	if len(capped) > limit {
+		capped = capped[:limit]
+	}
+	writeJSON(w, 200, map[string]any{
+		"available":      true,
+		"enabled":        cfg.ProxyPoolEnabled,
+		"autoRotate":     cfg.ProxyPoolAutoRotate,
+		"current":        cur,
+		"refreshing":     refreshing,
+		"usable":         usable,
+		"minUsable":      cfg.ProxyPoolMinUsable,
+		"total":          len(entries),
+		"shown":          len(capped),
+		"entries":        capped,
+		"lastAt":         lastAt,
+		"lastError":      lastErr,
+		"stats":          stats,
+		"sources":        sources,
+		"maxTest":        maxTest,
+		"concurrency":    conc,
+		"timeoutSec":     timeoutSec,
+		"verifyUpstream": verify,
+		"proxyMode":      cfg.ProxyMode,
+		"proxyURL":       cfg.ProxyURL,
+	})
+}
+
+// adminPoolRefresh kicks off a fetch+probe run. It returns immediately: a full
+// pass takes about a minute, and the dashboard polls /pool for progress.
+func (s *Server) adminPoolRefresh(w http.ResponseWriter, r *http.Request) {
+	if s.pool == nil {
+		writeJSON(w, 503, map[string]any{"ok": false, "error": "代理池不可用"})
+		return
+	}
+	go func() {
+		if _, _, err := s.pool.Refresh(context.Background()); err != nil && s.logger != nil {
+			s.logger.Warnf("手动刷新代理池失败: %v", err)
+		}
+	}()
+	writeJSON(w, 200, map[string]any{"ok": true, "started": true})
+}
+
+// adminPoolRotate moves to the next best egress on demand.
+func (s *Server) adminPoolRotate(w http.ResponseWriter, r *http.Request) {
+	if s.pool == nil {
+		writeJSON(w, 503, map[string]any{"ok": false, "error": "代理池不可用"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	url, err := s.pool.Rotate(ctx, false) // manual: do not retire the node
+	if err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	// a new egress means the old quota verdicts are meaningless
+	s.Lane.ClearThrottle()
+	go s.Lane.ProbeRound(context.Background(), true)
+	if s.logger != nil {
+		s.logger.Infof("手动切换出口 → %s", url)
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "current": url})
+}
+
+// adminPoolUse pins a specific egress ("" restores the direct connection).
+func (s *Server) adminPoolUse(w http.ResponseWriter, r *http.Request) {
+	if s.pool == nil {
+		writeJSON(w, 503, map[string]any{"ok": false, "error": "代理池不可用"})
+		return
+	}
+	var in struct {
+		URL string `json:"url"`
+	}
+	if err := decodeBody(r, &in); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	if err := s.pool.Use(strings.TrimSpace(in.URL)); err != nil {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	s.Lane.ClearThrottle()
+	go s.Lane.ProbeRound(context.Background(), true)
+	label := in.URL
+	if label == "" {
+		label = "本机直连"
+	}
+	if s.logger != nil {
+		s.logger.Infof("手动指定出口 → %s", label)
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "current": in.URL})
+}
+
+// poolSummary is the compact egress view embedded in /state; the full entry
+// list lives on /pool.
+func (s *Server) poolSummary() map[string]any {
+	if s.pool == nil {
+		return map[string]any{"available": false}
+	}
+	cur, _, refreshing, stats, _, lastErr := s.pool.Snapshot()
+	cfg := s.Store.Config()
+	return map[string]any{
+		"available":  true,
+		"enabled":    cfg.ProxyPoolEnabled,
+		"autoRotate": cfg.ProxyPoolAutoRotate,
+		"current":    cur,
+		"usable":     s.pool.UsableCount(),
+		"refreshing": refreshing,
+		"rotations":  stats.Rotations,
+		"fetched":    stats.Fetched,
+		"tested":     stats.Tested,
+		"passed":     stats.Passed,
+		"exhausted":  stats.Exhausted,
+		"lastError":  lastErr,
+	}
 }

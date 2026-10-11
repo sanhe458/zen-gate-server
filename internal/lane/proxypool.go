@@ -1,0 +1,787 @@
+package lane
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math/rand"
+	"net/http"
+	neturl "net/url"
+	"os"
+	"regexp"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+// DefaultProxySources are public, plain-text free-proxy listings. Each line is
+// "ip:port" or "scheme://ip:port"; a source whose URL mentions socks5 supplies
+// the scheme for its scheme-less lines. They are fetched directly (never
+// through the pool itself — no bootstrapping loop).
+var DefaultProxySources = []string{
+	"https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+	"https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+	"https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
+	"https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/http.txt",
+	"https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/proxies.txt",
+	"https://raw.githubusercontent.com/mmpx12/proxy-list/master/http.txt",
+	"https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+	"https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
+	"https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
+	"https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt",
+	"https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+}
+
+// ProxyEntry is one candidate egress.
+type ProxyEntry struct {
+	URL       string `json:"url"`  // canonical "http://1.2.3.4:8080"
+	Host      string `json:"host"` // "1.2.3.4:8080"
+	Scheme    string `json:"scheme"`
+	LatencyMs int64  `json:"latencyMs"`
+	OK        bool   `json:"ok"` // reachable + answered the upstream probe
+	Status    int    `json:"status,omitempty"`
+	// Exhausted marks an egress whose IP already burned its daily free quota.
+	// Such a proxy is reachable but useless for this lane.
+	Exhausted bool   `json:"exhausted"`
+	Country   string `json:"country,omitempty"`
+	Detail    string `json:"detail,omitempty"`
+	LastTest  int64  `json:"lastTest"`
+	Failures  int    `json:"failures,omitempty"`
+}
+
+// ProxyPool keeps a tested, latency-sorted set of free proxies and remembers
+// which egress the lane is currently using.
+type ProxyPool struct {
+	mu         sync.RWMutex
+	entries    []*ProxyEntry
+	byURL      map[string]*ProxyEntry
+	current    string // "" = direct (local connection)
+	refreshing bool
+	lastAt     int64
+	lastErr    string
+	poolStats  poolStats
+	// storagePath persists the tested set so a restart does not throw away a
+	// minute of probing (empty = in-memory only).
+	storagePath string
+
+	// configuration (guarded by mu)
+	sources        []string
+	maxTest        int
+	concurrency    int
+	timeout        time.Duration
+	verifyUpstream bool
+
+	log func(format string, args ...any)
+}
+
+type poolStats struct {
+	Fetched   int `json:"fetched"`
+	Tested    int `json:"tested"`
+	Passed    int `json:"passed"`
+	Exhausted int `json:"exhausted"`
+	Rotations int `json:"rotations"`
+}
+
+// candidateRe matches "ip:port" and "scheme://ip:port" forms.
+var candidateRe = regexp.MustCompile(`^(?:(https?|socks5h?|socks4)://)?([0-9a-zA-Z.\-]+):([0-9]{2,5})$`)
+
+// NewProxyPool builds a pool in direct mode with conservative defaults.
+// Free proxies are mostly dead, so the sample size has to be large for a
+// rotation to have anywhere to go: ~1500 candidates at 120-way concurrency
+// finishes in about a minute on a normal uplink.
+func NewProxyPool(log func(string, ...any)) *ProxyPool {
+	if log == nil {
+		log = func(string, ...any) {}
+	}
+	return &ProxyPool{
+		byURL:          map[string]*ProxyEntry{},
+		sources:        append([]string{}, DefaultProxySources...),
+		maxTest:        1500,
+		concurrency:    120,
+		timeout:        6 * time.Second,
+		verifyUpstream: true,
+		log:            log,
+	}
+}
+
+// Configure applies the dashboard settings. Zero values keep the current one.
+func (p *ProxyPool) Configure(sources []string, maxTest, concurrency, timeoutSec int, verifyUpstream bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(sources) > 0 {
+		clean := []string{}
+		for _, s := range sources {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				clean = append(clean, s)
+			}
+		}
+		if len(clean) > 0 {
+			p.sources = clean
+		}
+	}
+	if maxTest > 0 {
+		p.maxTest = maxTest
+	}
+	if concurrency > 0 {
+		p.concurrency = concurrency
+	}
+	if timeoutSec > 0 {
+		p.timeout = time.Duration(timeoutSec) * time.Second
+	}
+	p.verifyUpstream = verifyUpstream
+}
+
+// Config returns the current pool parameters (for the dashboard).
+func (p *ProxyPool) Config() (sources []string, maxTest, concurrency, timeoutSec int, verifyUpstream bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return append([]string{}, p.sources...), p.maxTest, p.concurrency, int(p.timeout / time.Second), p.verifyUpstream
+}
+
+// Snapshot is the dashboard view: the current egress plus every tested entry.
+func (p *ProxyPool) Snapshot() (current string, entries []ProxyEntry, refreshing bool, stats poolStats, lastAt int64, lastErr string) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]ProxyEntry, 0, len(p.entries))
+	for _, e := range p.entries {
+		out = append(out, *e)
+	}
+	// usable first, shortest latency first
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].OK != out[j].OK {
+			return out[i].OK
+		}
+		if out[i].Exhausted != out[j].Exhausted {
+			return !out[i].Exhausted
+		}
+		return out[i].LatencyMs < out[j].LatencyMs
+	})
+	return p.current, out, p.refreshing, p.poolStats, p.lastAt, p.lastErr
+}
+
+// Current returns the proxy URL in use ("" = direct).
+func (p *ProxyPool) Current() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.current
+}
+
+// Use switches the active egress. url == "" restores the direct connection.
+func (p *ProxyPool) Use(url string) error {
+	p.mu.Lock()
+	if url != "" {
+		if _, ok := p.byURL[url]; !ok {
+			p.mu.Unlock()
+			return fmt.Errorf("代理不在池中: %s", url)
+		}
+	}
+	p.current = url
+	p.mu.Unlock()
+	p.apply()
+	return nil
+}
+
+// apply pushes the current selection into the shared transport.
+func (p *ProxyPool) apply() {
+	cur := p.Current()
+	if cur == "" {
+		SetActiveProxy(nil)
+		p.log("出口切换 → 本机直连")
+		return
+	}
+	u, err := neturl.Parse(cur)
+	if err != nil {
+		SetActiveProxy(nil)
+		return
+	}
+	SetActiveProxy(u)
+	p.log("出口切换 → %s", cur)
+}
+
+// MarkExhausted flags the current egress as quota-burned so it is not picked
+// again this session.
+func (p *ProxyPool) MarkExhausted(url string) {
+	if url == "" {
+		return
+	}
+	p.mu.Lock()
+	if e, ok := p.byURL[url]; ok {
+		e.Exhausted = true
+		e.Detail = "本 IP 额度已耗尽"
+	}
+	p.mu.Unlock()
+}
+
+// Usable lists reachable, non-exhausted proxies sorted by latency.
+func (p *ProxyPool) Usable() []*ProxyEntry {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := []*ProxyEntry{}
+	for _, e := range p.entries {
+		if e.OK && !e.Exhausted {
+			out = append(out, e)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].LatencyMs < out[j].LatencyMs })
+	return out
+}
+
+// UsableCount reports how many rotation candidates are ready.
+func (p *ProxyPool) UsableCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	n := 0
+	for _, e := range p.entries {
+		if e.OK && !e.Exhausted {
+			n++
+		}
+	}
+	return n
+}
+
+// Rotate moves to the lowest-latency usable proxy that is not the current one.
+// markPrev records the outgoing egress as quota-burned — correct when rotation
+// was triggered by a 429, wrong when the user just wants a different exit (a
+// manual switch must not silently retire nodes). It refreshes the pool when it
+// runs dry. Returns the new proxy URL ("" = nothing available).
+func (p *ProxyPool) Rotate(ctx context.Context, markPrev bool) (string, error) {
+	p.mu.Lock()
+	prev := p.current
+	if markPrev && prev != "" {
+		if e, ok := p.byURL[prev]; ok {
+			e.Exhausted = true
+			e.Detail = "本 IP 额度已耗尽"
+		}
+	}
+	var best *ProxyEntry
+	for _, e := range p.entries {
+		if !e.OK || e.Exhausted || e.URL == prev {
+			continue
+		}
+		if best == nil || e.LatencyMs < best.LatencyMs {
+			best = e
+		}
+	}
+	p.mu.Unlock()
+
+	if best == nil {
+		// pool dry — refill in place, then pick again
+		p.log("代理池已无可用节点，正在补充…")
+		if _, _, err := p.Refresh(ctx); err != nil {
+			p.lastErrSet(err)
+		}
+		p.mu.Lock()
+		for _, e := range p.entries {
+			if !e.OK || e.Exhausted || e.URL == prev {
+				continue
+			}
+			if best == nil || e.LatencyMs < best.LatencyMs {
+				best = e
+			}
+		}
+		p.mu.Unlock()
+	}
+	if best == nil {
+		return "", fmt.Errorf("代理池中没有可用节点")
+	}
+	p.mu.Lock()
+	p.current = best.URL
+	p.poolStats.Rotations++
+	p.mu.Unlock()
+	p.apply()
+	return best.URL, nil
+}
+
+func (p *ProxyPool) lastErrSet(err error) {
+	p.mu.Lock()
+	p.lastErr = err.Error()
+	p.mu.Unlock()
+}
+
+// Refresh fetches the sources and re-tests candidates. Safe to call
+// concurrently: a second call while one is running returns immediately.
+func (p *ProxyPool) Refresh(ctx context.Context) (tested, passed int, err error) {
+	p.mu.Lock()
+	if p.refreshing {
+		p.mu.Unlock()
+		return 0, 0, fmt.Errorf("正在刷新中")
+	}
+	p.refreshing = true
+	sources := append([]string{}, p.sources...)
+	maxTest := p.maxTest
+	conc := p.concurrency
+	verify := p.verifyUpstream
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		p.refreshing = false
+		p.lastAt = time.Now().UnixMilli()
+		p.mu.Unlock()
+		p.save()
+	}()
+
+	candidates, fetchErr := fetchProxyList(ctx, sources, p.log)
+	if len(candidates) == 0 {
+		if fetchErr != nil {
+			p.lastErrSet(fetchErr)
+			return 0, 0, fetchErr
+		}
+		e := fmt.Errorf("代理源未返回任何候选")
+		p.lastErrSet(e)
+		return 0, 0, e
+	}
+
+	// Carry the previous survivors to the front of the candidate list. Free
+	// proxy churn is brutal — a node that worked a minute ago is often not in
+	// this fetch at all — so a refresh must re-verify what is already known
+	// good instead of gambling the whole pool on a fresh random sample.
+	carried := 0
+	p.mu.RLock()
+	for _, e := range p.byURL {
+		if e.OK && !e.Exhausted {
+			candidates = append([]proxyCandidate{{Raw: e.URL, Scheme: e.Scheme}}, candidates...)
+			carried++
+		}
+	}
+	p.mu.RUnlock()
+	if carried > 0 {
+		p.log("保留上一轮 %d 个可用节点一并复测", carried)
+	}
+
+	// shuffle so a truncated run samples across sources instead of taking the
+	// head of one list
+	rand.Shuffle(len(candidates), func(i, j int) { candidates[i], candidates[j] = candidates[j], candidates[i] })
+	if maxTest > 0 && len(candidates) > maxTest {
+		candidates = candidates[:maxTest]
+	}
+
+	// note: the previous set stays in place until the new one is ready, so the
+	// dashboard keeps showing nodes during a refresh instead of blanking out
+	p.mu.Lock()
+	p.poolStats.Fetched = len(candidates)
+	p.mu.Unlock()
+
+	// concurrent probe
+	sem := make(chan struct{}, conc)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	results := make([]*ProxyEntry, 0, len(candidates))
+	var okCount, exhaustedCount int
+
+	seenURL := map[string]bool{}
+	for _, cand := range candidates {
+		u, host, scheme, ok := normalizeProxy(cand.Raw, cand.Scheme)
+		if !ok || seenURL[u] {
+			continue
+		}
+		seenURL[u] = true
+		wg.Add(1)
+		go func(u, host, scheme string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			e := p.testOne(ctx, u, host, scheme, verify)
+			mu.Lock()
+			results = append(results, e)
+			if e.OK && !e.Exhausted {
+				okCount++
+			}
+			if e.Exhausted {
+				exhaustedCount++
+			}
+			mu.Unlock()
+		}(u, host, scheme)
+	}
+	wg.Wait()
+
+	sort.SliceStable(results, func(i, j int) bool {
+		if results[i].OK != results[j].OK {
+			return results[i].OK
+		}
+		return results[i].LatencyMs < results[j].LatencyMs
+	})
+
+	p.mu.Lock()
+	p.byURL = map[string]*ProxyEntry{}
+	p.entries = results
+	for _, e := range results {
+		p.byURL[e.URL] = e
+	}
+	p.poolStats.Tested = len(results)
+	p.poolStats.Passed = okCount
+	p.poolStats.Exhausted = exhaustedCount
+	// keep the current selection if it survived the refresh
+	if p.current != "" {
+		if e, ok := p.byURL[p.current]; !ok || !e.OK || e.Exhausted {
+			p.current = ""
+		}
+	}
+	p.mu.Unlock()
+	p.apply()
+
+	p.log("代理池刷新完成：测试 %d 个，可用 %d 个（其中 %d 个额度已耗尽）", len(results), okCount, exhaustedCount)
+	return len(results), okCount, nil
+}
+
+// connectivityTarget is the lightweight reachability check used when upstream
+// verification is off: small, cacheable, served worldwide.
+const connectivityTarget = "http://www.msftconnecttest.com/connecttest.txt"
+
+// testOne measures one candidate: reachability, latency and — when upstream
+// verification is on — whether the lane is actually usable through it.
+//
+// A 200 from the upstream listing means the proxy works. A 429 means the proxy
+// works too, but its IP already burned the daily quota: recorded as reachable
+// yet exhausted, so the pool never wastes a rotation on it.
+func (p *ProxyPool) testOne(ctx context.Context, url, host, scheme string, verify bool) *ProxyEntry {
+	e := &ProxyEntry{URL: url, Host: host, Scheme: scheme, LastTest: time.Now().UnixMilli()}
+	u, err := neturl.Parse(url)
+	if err != nil {
+		e.Detail = "地址不合法"
+		return e
+	}
+	timeout := p.timeout
+	transport := &http.Transport{
+		Proxy:               http.ProxyURL(u),
+		DisableKeepAlives:   true,
+		MaxIdleConns:        1,
+		IdleConnTimeout:     5 * time.Second,
+		TLSHandshakeTimeout: timeout,
+	}
+	client := &http.Client{Timeout: timeout, Transport: transport}
+	defer client.CloseIdleConnections()
+
+	tctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	target := UpstreamBase + "/zen/v1/models"
+	if !verify {
+		target = connectivityTarget
+	}
+
+	t0 := time.Now()
+	req, err := http.NewRequestWithContext(tctx, http.MethodGet, target, nil)
+	if err != nil {
+		e.Detail = err.Error()
+		return e
+	}
+	if verify {
+		for k, v := range GatewayHeaders(SessionForConversation("pool-test"), MintRequestId(0), false, "application/json") {
+			req.Header.Set(k, v)
+		}
+	}
+	resp, err := client.Do(req)
+	latency := time.Since(t0).Milliseconds()
+	if err != nil {
+		e.LatencyMs = latency
+		e.Detail = shortErr(err)
+		return e
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+
+	e.LatencyMs = latency
+	e.Status = resp.StatusCode
+	if !verify {
+		// connectivity-only run: any HTTP answer proves the tunnel works
+		if resp.StatusCode < 400 {
+			e.OK = true
+			e.Detail = fmt.Sprintf("连通（HTTP %d，未验证上游）", resp.StatusCode)
+		} else {
+			e.Detail = fmt.Sprintf("HTTP %d", resp.StatusCode)
+			e.Failures = 1
+		}
+		return e
+	}
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		e.OK = true
+		e.Detail = "可用"
+	case resp.StatusCode == http.StatusTooManyRequests:
+		// reachable, but this IP is out of quota
+		e.OK = true
+		e.Exhausted = true
+		e.Detail = "该 IP 额度已耗尽"
+	case resp.StatusCode == http.StatusForbidden:
+		e.OK = true
+		e.Exhausted = true
+		e.Detail = "该 IP 被地区/风控拦截"
+	case resp.StatusCode >= 500:
+		e.Detail = fmt.Sprintf("上游 %d", resp.StatusCode)
+		e.Failures = 1
+	default:
+		if resp.StatusCode < 400 {
+			e.OK = true
+			e.Detail = fmt.Sprintf("HTTP %d", resp.StatusCode)
+		} else {
+			e.Detail = fmt.Sprintf("HTTP %d", resp.StatusCode)
+			e.Failures = 1
+		}
+	}
+	return e
+}
+
+func shortErr(err error) string {
+	s := err.Error()
+	if len(s) > 120 {
+		s = s[:120]
+	}
+	return s
+}
+
+// normalizeProxy turns a raw listing line into a canonical proxy URL.
+// defScheme applies when the line carries no explicit scheme (a socks5 list
+// yields scheme-less lines that must not be probed as HTTP proxies).
+func normalizeProxy(raw, defScheme string) (url, host, scheme string, ok bool) {
+	raw = strings.TrimSpace(raw)
+	raw = strings.Trim(raw, "\"'")
+	if raw == "" || strings.HasPrefix(raw, "#") {
+		return "", "", "", false
+	}
+	m := candidateRe.FindStringSubmatch(raw)
+	if m == nil {
+		return "", "", "", false
+	}
+	scheme, host = m[1], m[2]+":"+m[3]
+	if scheme == "" {
+		scheme = defScheme
+	}
+	if scheme == "" {
+		scheme = "http"
+	}
+	if scheme == "socks5h" {
+		scheme = "socks5"
+	}
+	if scheme != "http" && scheme != "https" && scheme != "socks5" && scheme != "socks4" {
+		return "", "", "", false
+	}
+	// skip obviously invalid hosts
+	if strings.Count(host, ".") != 3 && !strings.Contains(host, "localhost") {
+		if !strings.Contains(host, ":") { // IPv6-ish
+			return "", "", "", false
+		}
+	}
+	return scheme + "://" + host, host, scheme, true
+}
+
+// proxyFetchUA identifies this service when pulling listings (some CDNs
+// throttle anonymous clients).
+const proxyFetchUA = "zen-gate-server/1.0 (+https://github.com/sanhe458/zen-gate-server)"
+
+// proxyCandidate is one listing line plus the scheme its source implies.
+type proxyCandidate struct {
+	Raw    string
+	Scheme string
+}
+
+// fetchProxyList pulls every source concurrently and returns the deduplicated
+// candidates. Serial fetching was a real problem: a handful of slow or blocked
+// sources used to stall a refresh for minutes, so each source gets its own
+// goroutine and a short timeout, and partial success is enough.
+func fetchProxyList(ctx context.Context, sources []string, log func(string, ...any)) ([]proxyCandidate, error) {
+	type result struct {
+		src   string
+		cands []proxyCandidate
+		err   error
+	}
+	jobs := []string{}
+	for _, src := range sources {
+		if s := strings.TrimSpace(src); s != "" {
+			jobs = append(jobs, s)
+		}
+	}
+	if len(jobs) == 0 {
+		return nil, fmt.Errorf("未配置代理源")
+	}
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	ch := make(chan result, len(jobs))
+	var wg sync.WaitGroup
+	for _, src := range jobs {
+		wg.Add(1)
+		go func(src string) {
+			defer wg.Done()
+			cands, err := fetchOneSource(ctx, client, src)
+			ch <- result{src: src, cands: cands, err: err}
+		}(src)
+	}
+	wg.Wait()
+	close(ch)
+
+	seen := map[string]bool{}
+	out := []proxyCandidate{}
+	good := 0
+	var lastErr error
+	for r := range ch {
+		if r.err != nil {
+			lastErr = r.err
+			log("代理源拉取失败 %s: %v", r.src, r.err)
+			continue
+		}
+		good++
+		for _, c := range r.cands {
+			if seen[c.Raw] {
+				continue
+			}
+			seen[c.Raw] = true
+			out = append(out, c)
+		}
+	}
+	if good == 0 && lastErr != nil {
+		return out, fmt.Errorf("全部代理源均拉取失败: %v", lastErr)
+	}
+	return out, nil
+}
+
+// fetchOneSource downloads and parses a single listing.
+func fetchOneSource(ctx context.Context, client *http.Client, src string) ([]proxyCandidate, error) {
+	defScheme := "http"
+	lower := strings.ToLower(src)
+	if strings.Contains(lower, "socks5") {
+		defScheme = "socks5"
+	} else if strings.Contains(lower, "socks4") {
+		defScheme = "socks4"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("user-agent", proxyFetchUA)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	out := []proxyCandidate{}
+	sc := bufio.NewScanner(strings.NewReader(string(body)))
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if strings.HasPrefix(line, "[") || strings.HasPrefix(line, "{") {
+			for _, s := range extractJSONStrings(line) {
+				out = append(out, proxyCandidate{Raw: s, Scheme: defScheme})
+			}
+			continue
+		}
+		if line == "" {
+			continue
+		}
+		out = append(out, proxyCandidate{Raw: line, Scheme: defScheme})
+	}
+	return out, nil
+}
+
+// extractJSONStrings salvages "host:port" strings from a JSON line.
+func extractJSONStrings(line string) []string {
+	var arr []map[string]any
+	if err := json.Unmarshal([]byte(line), &arr); err == nil {
+		out := []string{}
+		for _, m := range arr {
+			ip, _ := m["ip"].(string)
+			port := ""
+			switch v := m["port"].(type) {
+			case float64:
+				port = fmt.Sprintf("%.0f", v)
+			case string:
+				port = v
+			}
+			if ip != "" && port != "" {
+				out = append(out, ip+":"+port)
+			}
+		}
+		return out
+	}
+	var strs []string
+	if err := json.Unmarshal([]byte(line), &strs); err == nil {
+		return strs
+	}
+	return nil
+}
+
+// --- persistence --------------------------------------------------------------
+
+// SetStorage points the pool at a JSON file used to carry the tested set
+// across restarts. Call Load right after.
+func (p *ProxyPool) SetStorage(path string) {
+	p.mu.Lock()
+	p.storagePath = path
+	p.mu.Unlock()
+}
+
+type poolFile struct {
+	SavedAt int64         `json:"savedAt"`
+	Stats   poolStats     `json:"stats"`
+	Entries []*ProxyEntry `json:"entries"`
+}
+
+// Load restores the last saved set. Entries are kept as-is; the next Refresh
+// re-verifies every survivor (they are carried to the front of the candidate
+// list), so a stale node never survives long.
+func (p *ProxyPool) Load() error {
+	p.mu.RLock()
+	path := p.storagePath
+	p.mu.RUnlock()
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var pf poolFile
+	if err := json.Unmarshal(data, &pf); err != nil {
+		return err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.entries = nil
+	p.byURL = map[string]*ProxyEntry{}
+	for _, e := range pf.Entries {
+		if e == nil || e.URL == "" {
+			continue
+		}
+		p.entries = append(p.entries, e)
+		p.byURL[e.URL] = e
+	}
+	p.poolStats = pf.Stats
+	p.lastAt = pf.SavedAt
+	return nil
+}
+
+// save writes the tested set; only worthwhile entries are kept (reachable
+// ones, so exhausted/dead nodes do not accumulate in the file).
+func (p *ProxyPool) save() {
+	p.mu.RLock()
+	path := p.storagePath
+	keep := make([]*ProxyEntry, 0, len(p.entries))
+	for _, e := range p.entries {
+		if e.OK {
+			keep = append(keep, e)
+		}
+	}
+	pf := poolFile{SavedAt: p.lastAt, Stats: p.poolStats, Entries: keep}
+	p.mu.RUnlock()
+	if path == "" {
+		return
+	}
+	data, err := json.MarshalIndent(pf, "", "  ")
+	if err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, path)
+}

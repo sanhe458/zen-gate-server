@@ -44,9 +44,11 @@ var startedAt = time.Now()
 type Server struct {
 	Lane  *lane.Lane
 	Store *store.Store
-	mux   *http.ServeMux
-	srv   *http.Server
-	addr  atomic.Value // string
+	// pool is the proxy pool, wired by main when the feature is available.
+	pool *lane.ProxyPool
+	mux  *http.ServeMux
+	srv  *http.Server
+	addr atomic.Value // string
 	// logger is injected by main; nil-safe helpers fall back to empty.
 	logger interface {
 		Tail(minLevel string, limit int) []logx.Entry
@@ -58,6 +60,10 @@ type Server struct {
 	// cookies so tokens never repeat across restarts.
 	webKey []byte
 }
+
+// SetProxyPool wires the egress pool (nil-safe: the dashboard hides the page
+// when no pool was injected).
+func (s *Server) SetProxyPool(p *lane.ProxyPool) { s.pool = p }
 
 // SetLogger wires the logx logger (as a structural interface, no import cycle).
 func (s *Server) SetLogger(l interface {
