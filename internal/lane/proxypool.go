@@ -18,10 +18,17 @@ import (
 )
 
 // DefaultProxySources are public, plain-text free-proxy listings. Each line is
-// "ip:port" or "scheme://ip:port"; a source whose URL mentions socks5 supplies
-// the scheme for its scheme-less lines. They are fetched directly (never
-// through the pool itself — no bootstrapping loop).
+// "ip:port" or "scheme://ip:port", optionally with a trailing "#cc" country
+// annotation; a source whose URL mentions socks5 supplies the scheme for its
+// scheme-less lines. They are fetched directly (never through the pool itself
+// — no bootstrapping loop).
+//
+// Order matters only in that ProxyClean sits first: it is a maintained,
+// continuously-revalidated SOCKS5 list (connectivity verified from mainland
+// China every hour), so its hit rate is far above the raw scrapes below.
 var DefaultProxySources = []string{
+	// 持续保活 + 国内连通性验证的清洗池（质量最高）
+	"https://raw.githubusercontent.com/HankNovic/ProxyClean/main/SOCKS5.txt",
 	"https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
 	"https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
 	"https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
@@ -47,9 +54,13 @@ type ProxyEntry struct {
 	// Such a proxy is reachable but useless for this lane.
 	Exhausted bool   `json:"exhausted"`
 	Country   string `json:"country,omitempty"`
-	Detail    string `json:"detail,omitempty"`
-	LastTest  int64  `json:"lastTest"`
-	Failures  int    `json:"failures,omitempty"`
+	// EgressIP is the public address this proxy actually exits from, measured
+	// through it. Two listings behind one IP share one daily quota, so this
+	// keeps rotation from wasting a hop on a "different" proxy that is not.
+	EgressIP string `json:"egressIp,omitempty"`
+	Detail   string `json:"detail,omitempty"`
+	LastTest int64  `json:"lastTest"`
+	Failures int    `json:"failures,omitempty"`
 }
 
 // ProxyPool keeps a tested, latency-sorted set of free proxies and remembers
@@ -251,20 +262,36 @@ func (p *ProxyPool) UsableCount() int {
 func (p *ProxyPool) Rotate(ctx context.Context, markPrev bool) (string, error) {
 	p.mu.Lock()
 	prev := p.current
-	if markPrev && prev != "" {
+	curIP := ""
+	if prev != "" {
 		if e, ok := p.byURL[prev]; ok {
-			e.Exhausted = true
-			e.Detail = "本 IP 额度已耗尽"
+			curIP = e.EgressIP
+			if markPrev {
+				e.Exhausted = true
+				e.Detail = "本 IP 额度已耗尽"
+			}
 		}
 	}
-	var best *ProxyEntry
+	// Prefer a node on a genuinely different exit. Quota is per IP, so a
+	// second port behind the same address only buys another 429 — the pool
+	// falls back to one when nothing else is left.
+	var best, sameExit *ProxyEntry
 	for _, e := range p.entries {
 		if !e.OK || e.Exhausted || e.URL == prev {
+			continue
+		}
+		if curIP != "" && e.EgressIP == curIP {
+			if sameExit == nil || e.LatencyMs < sameExit.LatencyMs {
+				sameExit = e
+			}
 			continue
 		}
 		if best == nil || e.LatencyMs < best.LatencyMs {
 			best = e
 		}
+	}
+	if best == nil {
+		best = sameExit
 	}
 	p.mu.Unlock()
 
@@ -279,9 +306,18 @@ func (p *ProxyPool) Rotate(ctx context.Context, markPrev bool) (string, error) {
 			if !e.OK || e.Exhausted || e.URL == prev {
 				continue
 			}
+			if curIP != "" && e.EgressIP == curIP {
+				if sameExit == nil || e.LatencyMs < sameExit.LatencyMs {
+					sameExit = e
+				}
+				continue
+			}
 			if best == nil || e.LatencyMs < best.LatencyMs {
 				best = e
 			}
+		}
+		if best == nil {
+			best = sameExit
 		}
 		p.mu.Unlock()
 	}
@@ -343,7 +379,7 @@ func (p *ProxyPool) Refresh(ctx context.Context) (tested, passed int, err error)
 	p.mu.RLock()
 	for _, e := range p.byURL {
 		if e.OK && !e.Exhausted {
-			candidates = append([]proxyCandidate{{Raw: e.URL, Scheme: e.Scheme}}, candidates...)
+			candidates = append([]proxyCandidate{{Raw: e.URL, Scheme: e.Scheme, Country: e.Country}}, candidates...)
 			carried++
 		}
 	}
@@ -380,11 +416,11 @@ func (p *ProxyPool) Refresh(ctx context.Context) (tested, passed int, err error)
 		}
 		seenURL[u] = true
 		wg.Add(1)
-		go func(u, host, scheme string) {
+		go func(u, host, scheme, country string) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			e := p.testOne(ctx, u, host, scheme, verify)
+			e := p.testOne(ctx, u, host, scheme, country, verify)
 			mu.Lock()
 			results = append(results, e)
 			if e.OK && !e.Exhausted {
@@ -394,7 +430,7 @@ func (p *ProxyPool) Refresh(ctx context.Context) (tested, passed int, err error)
 				exhaustedCount++
 			}
 			mu.Unlock()
-		}(u, host, scheme)
+		}(u, host, scheme, cand.Country)
 	}
 	wg.Wait()
 
@@ -437,8 +473,10 @@ const connectivityTarget = "http://www.msftconnecttest.com/connecttest.txt"
 // A 200 from the upstream listing means the proxy works. A 429 means the proxy
 // works too, but its IP already burned the daily quota: recorded as reachable
 // yet exhausted, so the pool never wastes a rotation on it.
-func (p *ProxyPool) testOne(ctx context.Context, url, host, scheme string, verify bool) *ProxyEntry {
-	e := &ProxyEntry{URL: url, Host: host, Scheme: scheme, LastTest: time.Now().UnixMilli()}
+func (p *ProxyPool) testOne(ctx context.Context, url, host, scheme, annotCountry string, verify bool) *ProxyEntry {
+	// a listing annotation is a hint, not a measurement: keep it only as a
+	// placeholder that a real egress lookup can later replace
+	e := &ProxyEntry{URL: url, Host: host, Scheme: scheme, Country: annotCountry, LastTest: time.Now().UnixMilli()}
 	u, err := neturl.Parse(url)
 	if err != nil {
 		e.Detail = "地址不合法"
@@ -478,7 +516,7 @@ func (p *ProxyPool) testOne(ctx context.Context, url, host, scheme string, verif
 	latency := time.Since(t0).Milliseconds()
 	if err != nil {
 		e.LatencyMs = latency
-		e.Detail = shortErr(err)
+		e.Detail = classifyProxyError(err)
 		return e
 	}
 	defer resp.Body.Close()
@@ -522,7 +560,62 @@ func (p *ProxyPool) testOne(ctx context.Context, url, host, scheme string, verif
 			e.Failures = 1
 		}
 	}
+	if e.OK && !e.Exhausted {
+		e.EgressIP = p.lookupEgressIP(ctx, client)
+	}
 	return e
+}
+
+// classifyProxyError turns a transport failure into something a human can act
+// on. The TLS case matters most: a proxy that cannot pass certificate
+// validation is intercepting the connection and must never be used.
+func classifyProxyError(err error) string {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "failed to verify certificate"),
+		strings.Contains(msg, "x509:"),
+		strings.Contains(msg, "certificate signed by unknown authority"):
+		return "TLS 证书校验失败（疑似中间人窃听，已拒绝）"
+	case strings.Contains(msg, "socks connect"),
+		strings.Contains(msg, "socks5"):
+		return "SOCKS 握手失败：" + shortErr(err)
+	case strings.Contains(msg, "proxyconnect"):
+		return "代理连接失败：" + shortErr(err)
+	case strings.Contains(msg, "timeout"), strings.Contains(msg, "deadline exceeded"):
+		return "超时"
+	case strings.Contains(msg, "connection refused"):
+		return "连接被拒绝"
+	default:
+		return shortErr(err)
+	}
+}
+
+// egressEchoURL is a tiny public IP echo service used to learn which address a
+// proxy actually presents.
+const egressEchoURL = "https://api.ipify.org?format=json"
+
+// lookupEgressIP asks the echo service what address the proxy exits from.
+// Non-fatal by design: the proxy is still usable when this fails, we just
+// cannot advertise which IP it uses.
+func (p *ProxyPool) lookupEgressIP(ctx context.Context, client *http.Client) string {
+	tctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(tctx, http.MethodGet, egressEchoURL, nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	var out struct {
+		IP string `json:"ip"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&out); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out.IP)
 }
 
 func shortErr(err error) string {
@@ -572,10 +665,21 @@ func normalizeProxy(raw, defScheme string) (url, host, scheme string, ok bool) {
 // throttle anonymous clients).
 const proxyFetchUA = "zen-gate-server/1.0 (+https://github.com/sanhe458/zen-gate-server)"
 
-// proxyCandidate is one listing line plus the scheme its source implies.
+// proxyCandidate is one listing line plus the scheme its source implies and
+// any geo annotation the source carried.
 type proxyCandidate struct {
-	Raw    string
-	Scheme string
+	Raw     string
+	Scheme  string
+	Country string
+}
+
+// splitAnnotation peels a trailing "#country" annotation off a listing line
+// (ProxyClean-style listings carry one) and returns it separately.
+func splitAnnotation(line string) (addr, note string) {
+	if i := strings.Index(line, "#"); i >= 0 {
+		return strings.TrimSpace(line[:i]), strings.TrimSpace(line[i+1:])
+	}
+	return strings.TrimSpace(line), ""
 }
 
 // fetchProxyList pulls every source concurrently and returns the deduplicated
@@ -677,7 +781,11 @@ func fetchOneSource(ctx context.Context, client *http.Client, src string) ([]pro
 		if line == "" {
 			continue
 		}
-		out = append(out, proxyCandidate{Raw: line, Scheme: defScheme})
+		addr, note := splitAnnotation(line)
+		if addr == "" {
+			continue
+		}
+		out = append(out, proxyCandidate{Raw: addr, Scheme: defScheme, Country: note})
 	}
 	return out, nil
 }

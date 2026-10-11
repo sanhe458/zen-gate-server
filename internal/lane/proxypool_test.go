@@ -267,3 +267,45 @@ func TestPoolModeRoutesThroughDynamicProxy(t *testing.T) {
 		t.Error("clearing the proxy did not restore the direct connection")
 	}
 }
+
+// TestSplitAnnotation covers the ProxyClean-style trailing "#cc" annotation,
+// which used to make every line of that source fail to parse.
+func TestSplitAnnotation(t *testing.T) {
+	cases := []struct{ in, addr, note string }{
+		{"1.2.3.4:1080 #hk", "1.2.3.4:1080", "hk"},
+		{"socks5://1.2.3.4:1080 #us", "socks5://1.2.3.4:1080", "us"},
+		{"1.2.3.4:1080", "1.2.3.4:1080", ""},
+		{"  1.2.3.4:1080   # nl  ", "1.2.3.4:1080", "nl"},
+	}
+	for _, c := range cases {
+		addr, note := splitAnnotation(c.in)
+		if addr != c.addr || note != c.note {
+			t.Errorf("splitAnnotation(%q) = (%q, %q), want (%q, %q)", c.in, addr, note, c.addr, c.note)
+		}
+	}
+}
+
+// TestProxyCleanLineParses walks a real ProxyClean line end to end: annotate →
+// normalise, the two steps the fetch path performs.
+func TestProxyCleanLineParses(t *testing.T) {
+	for _, in := range []string{
+		"socks5://47.238.126.208:1080 #hk",
+		"socks5://192.252.220.89:4145 #us",
+		"socks5://45.74.31.25:6420 #nl",
+	} {
+		addr, note := splitAnnotation(in)
+		if note == "" {
+			t.Fatalf("%q: country annotation lost", in)
+		}
+		url, host, scheme, ok := normalizeProxy(addr, "socks5")
+		if !ok {
+			t.Fatalf("%q: address did not parse (addr=%q)", in, addr)
+		}
+		if scheme != "socks5" {
+			t.Errorf("%q: scheme = %q, want socks5", in, scheme)
+		}
+		if host == "" || url == "" {
+			t.Errorf("%q: empty host/url", in)
+		}
+	}
+}

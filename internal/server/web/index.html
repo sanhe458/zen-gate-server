@@ -365,8 +365,8 @@ pre{background:#0a0e14;border:1px solid var(--line);border-radius:10px;padding:1
     </div>
     <div style="max-height:520px;overflow-y:auto;margin-top:10px">
       <table>
-        <thead><tr><th>代理地址</th><th>延迟</th><th>状态</th><th>出口</th><th>最近测试</th><th></th></tr></thead>
-        <tbody id="poolBody"><tr><td colspan="6" class="mut">尚未刷新代理池</td></tr></tbody>
+        <thead><tr><th>代理地址</th><th>延迟</th><th>状态</th><th>出口 IP</th><th>详情</th><th>最近测试</th><th></th></tr></thead>
+        <tbody id="poolBody"><tr><td colspan="7" class="mut">尚未刷新代理池</td></tr></tbody>
       </table>
     </div>
   </div>
@@ -879,7 +879,7 @@ async function fetchPool(){
   try{
     POOL=await api("pool");
     if(!POOL||!POOL.available){
-      $("poolBody").innerHTML='<tr><td colspan="6" class="mut">代理池不可用</td></tr>';
+      $("poolBody").innerHTML='<tr><td colspan="7" class="mut">代理池不可用</td></tr>';
       return;
     }
     renderPoolStats();
@@ -913,7 +913,7 @@ function renderPoolTable(){
   if(onlyUsable)list=list.filter(e=>e.ok&&!e.exhausted);
   const tb=$("poolBody");
   if(!list.length){
-    tb.innerHTML='<tr><td colspan="6" class="mut">'+(onlyUsable?"暂无可用的代理节点，点上面「刷新代理池」重新抓取":"暂无数据")+'</td></tr>';
+    tb.innerHTML='<tr><td colspan="7" class="mut">'+(onlyUsable?"暂无可用的代理节点，点上面「刷新代理池」重新抓取":"暂无数据")+'</td></tr>';
     return;
   }
   tb.innerHTML=list.map(e=>{
@@ -926,7 +926,8 @@ function renderPoolTable(){
       '<td class="mono">'+esc(e.url)+(isCur?' <span class="pill" style="color:var(--acc)">当前</span>':'')+'</td>'+
       '<td class="mono">'+(e.latencyMs?e.latencyMs+" ms":"–")+'</td>'+
       '<td><span class="st '+cls+'">'+st+'</span></td>'+
-      '<td class="mut">'+esc(e.country||e.detail||"")+'</td>'+
+      '<td class="mono">'+esc(e.egressIp||"–")+(e.country?' <span class="pill">'+esc(e.country)+'</span>':'')+'</td>'+
+      '<td class="mut">'+esc(e.detail||"")+'</td>'+
       '<td class="mut">'+(e.lastTest?ago(e.lastTest):"–")+'</td>'+
       '<td>'+(e.ok&&!e.exhausted?'<button class="btn" data-u="'+esc(e.url)+'" onclick="poolUse(this)">使用</button>':"")+'</td>'+
     '</tr>';
