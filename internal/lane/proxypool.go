@@ -12,6 +12,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,8 +28,13 @@ import (
 // continuously-revalidated SOCKS5 list (connectivity verified from mainland
 // China every hour), so its hit rate is far above the raw scrapes below.
 var DefaultProxySources = []string{
-	// 持续保活 + 国内连通性验证的清洗池（质量最高）
+	// 持续保活 + 国内连通性验证的清洗池
 	"https://raw.githubusercontent.com/HankNovic/ProxyClean/main/SOCKS5.txt",
+	// scdn.io 公益池（CDN 服务商维护）。它的 API 每轮随机返回 20 个服务端
+	// 已校验的节点，用 #repeat 多轮累积；协议必须分开请求，因为 all 会混入
+	// SOCKS 类型，混在一起按 HTTP 测会误判。
+	"https://proxy.scdn.io/api/get_proxy.php?protocol=http&count=20#repeat=5",
+	"https://proxy.scdn.io/api/get_proxy.php?protocol=socks5&count=20#repeat=3",
 	"https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
 	"https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
 	"https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
@@ -119,18 +125,21 @@ func NewProxyPool(log func(string, ...any)) *ProxyPool {
 }
 
 // Configure applies the dashboard settings. Zero values keep the current one.
+// Passing an empty (but non-nil) source list restores the built-in defaults,
+// which is what clearing the textarea in the dashboard should mean.
 func (p *ProxyPool) Configure(sources []string, maxTest, concurrency, timeoutSec int, verifyUpstream bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if len(sources) > 0 {
+	if sources != nil {
 		clean := []string{}
 		for _, s := range sources {
-			s = strings.TrimSpace(s)
-			if s != "" {
-				clean = append(clean, s)
+			if t := strings.TrimSpace(s); t != "" {
+				clean = append(clean, t)
 			}
 		}
-		if len(clean) > 0 {
+		if len(clean) == 0 {
+			p.sources = append([]string{}, DefaultProxySources...)
+		} else {
 			p.sources = clean
 		}
 	}
@@ -673,6 +682,93 @@ type proxyCandidate struct {
 	Country string
 }
 
+// splitRepeat reads an optional "#repeat=N" trailer off a source URL. Some
+// providers (scdn.io among them) expose a verified-but-tiny API endpoint that
+// hands back a handful of randomised proxies per call, so one URL has to be
+// polled several times to accumulate a useful batch. The fragment is stripped
+// before the request — it is never sent to the server.
+func splitRepeat(src string) (string, int) {
+	const marker = "#repeat="
+	if i := strings.LastIndex(src, marker); i >= 0 {
+		if n, err := strconv.Atoi(strings.TrimSpace(src[i+len(marker):])); err == nil {
+			if n < 1 {
+				n = 1
+			}
+			if n > 50 {
+				n = 50
+			}
+			return strings.TrimSpace(src[:i]), n
+		}
+	}
+	return src, 1
+}
+
+// looksLikeProxy reports whether a string is a bare "ip:port" address.
+func looksLikeProxy(s string) bool {
+	m := candidateRe.FindStringSubmatch(strings.TrimSpace(s))
+	return m != nil
+}
+
+// extractProxyStrings walks an arbitrary JSON value and collects every proxy
+// address it can find — both bare "ip:port" strings (scdn.io's shape) and
+// {"ip":..,"port":..} object pairs (older free-list APIs).
+func extractProxyStrings(v any, out *[]string) {
+	switch t := v.(type) {
+	case string:
+		if looksLikeProxy(t) {
+			*out = append(*out, strings.TrimSpace(t))
+		}
+	case []any:
+		for _, x := range t {
+			extractProxyStrings(x, out)
+		}
+	case map[string]any:
+		if ip, ok := t["ip"].(string); ok && ip != "" {
+			port := ""
+			switch pv := t["port"].(type) {
+			case float64:
+				port = fmt.Sprintf("%.0f", pv)
+			case string:
+				port = pv
+			}
+			if port != "" {
+				*out = append(*out, ip+":"+port)
+				return
+			}
+		}
+		for _, x := range t {
+			extractProxyStrings(x, out)
+		}
+	}
+}
+
+// parseProxyBody extracts candidate addresses from a source response, which is
+// either a whole JSON document (API endpoints) or one proxy per line.
+func parseProxyBody(body []byte) []string {
+	trimmed := strings.TrimSpace(string(body))
+	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+		var v any
+		if err := json.Unmarshal([]byte(trimmed), &v); err == nil {
+			var out []string
+			extractProxyStrings(v, &out)
+			if len(out) > 0 {
+				return out
+			}
+		}
+	}
+	out := []string{}
+	sc := bufio.NewScanner(strings.NewReader(string(body)))
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
 // splitAnnotation peels a trailing "#country" annotation off a listing line
 // (ProxyClean-style listings carry one) and returns it separately.
 func splitAnnotation(line string) (addr, note string) {
@@ -741,16 +837,72 @@ func fetchProxyList(ctx context.Context, sources []string, log func(string, ...a
 	return out, nil
 }
 
-// fetchOneSource downloads and parses a single listing.
+// fetchOneSource downloads and parses a single listing. A "#repeat=N" trailer
+// makes it poll the same endpoint N times and merge the results, which is what
+// API-style sources need: they hand back a random handful per call.
 func fetchOneSource(ctx context.Context, client *http.Client, src string) ([]proxyCandidate, error) {
-	defScheme := "http"
-	lower := strings.ToLower(src)
-	if strings.Contains(lower, "socks5") {
-		defScheme = "socks5"
-	} else if strings.Contains(lower, "socks4") {
-		defScheme = "socks4"
+	url, repeat := splitRepeat(src)
+	defScheme := schemeForSource(url)
+
+	seen := map[string]bool{}
+	out := []proxyCandidate{}
+	var lastErr error
+	okCalls := 0
+	for i := 0; i < repeat; i++ {
+		body, err := httpGetBody(ctx, client, url)
+		if err != nil {
+			lastErr = err
+			if i == 0 {
+				return nil, err // the endpoint itself is unreachable
+			}
+			break // later rounds failing is fine, keep what we have
+		}
+		okCalls++
+		for _, line := range parseProxyBody(body) {
+			addr, note := splitAnnotation(line)
+			if addr == "" || seen[addr] {
+				continue
+			}
+			seen[addr] = true
+			out = append(out, proxyCandidate{Raw: addr, Scheme: defScheme, Country: note})
+		}
+		if i+1 < repeat {
+			select { // be a good citizen between polls
+			case <-ctx.Done():
+				return out, nil
+			case <-time.After(300 * time.Millisecond):
+			}
+		}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src, nil)
+	if okCalls == 0 && lastErr != nil {
+		return out, lastErr
+	}
+	return out, nil
+}
+
+// schemeForSource infers a listing's proxy protocol from its URL. Only the
+// path and query are inspected: looking at the whole URL would read the
+// "https://" scheme of the listing itself as the proxy protocol, which would
+// silently mislabel every HTTPS-hosted list.
+func schemeForSource(rawURL string) string {
+	u, err := neturl.Parse(rawURL)
+	if err != nil {
+		return "http"
+	}
+	target := strings.ToLower(u.Path + "?" + u.RawQuery)
+	switch {
+	case strings.Contains(target, "socks5"):
+		return "socks5"
+	case strings.Contains(target, "socks4"):
+		return "socks4"
+	case strings.Contains(target, "protocol=https"), strings.Contains(target, "type=https"):
+		return "https"
+	}
+	return "http"
+}
+
+func httpGetBody(ctx context.Context, client *http.Client, url string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -760,34 +912,10 @@ func fetchOneSource(ctx context.Context, client *http.Client, src string) ([]pro
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-	if err != nil {
-		return nil, err
-	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	out := []proxyCandidate{}
-	sc := bufio.NewScanner(strings.NewReader(string(body)))
-	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if strings.HasPrefix(line, "[") || strings.HasPrefix(line, "{") {
-			for _, s := range extractJSONStrings(line) {
-				out = append(out, proxyCandidate{Raw: s, Scheme: defScheme})
-			}
-			continue
-		}
-		if line == "" {
-			continue
-		}
-		addr, note := splitAnnotation(line)
-		if addr == "" {
-			continue
-		}
-		out = append(out, proxyCandidate{Raw: addr, Scheme: defScheme, Country: note})
-	}
-	return out, nil
+	return io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 }
 
 // extractJSONStrings salvages "host:port" strings from a JSON line.

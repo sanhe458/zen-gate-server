@@ -309,3 +309,72 @@ func TestProxyCleanLineParses(t *testing.T) {
 		}
 	}
 }
+
+// TestSplitRepeat covers the "#repeat=N" trailer that API-style sources use to
+// accumulate several randomised batches in one refresh.
+func TestSplitRepeat(t *testing.T) {
+	cases := []struct {
+		in, url string
+		n       int
+	}{
+		{"https://a/b", "https://a/b", 1},
+		{"https://a/b#repeat=5", "https://a/b", 5},
+		{"https://a/b?protocol=socks5&count=20#repeat=3", "https://a/b?protocol=socks5&count=20", 3},
+		{"https://a/b#repeat=0", "https://a/b", 1},
+		{"https://a/b#repeat=999", "https://a/b", 50},
+		{"https://a/b#repeat=abc", "https://a/b#repeat=abc", 1},
+	}
+	for _, c := range cases {
+		url, n := splitRepeat(c.in)
+		if url != c.url || n != c.n {
+			t.Errorf("splitRepeat(%q) = (%q, %d), want (%q, %d)", c.in, url, n, c.url, c.n)
+		}
+	}
+}
+
+// TestParseProxyBodyScdnJSON pins the exact response shape of the scdn.io API,
+// which is a whole JSON document rather than one proxy per line.
+func TestParseProxyBodyScdnJSON(t *testing.T) {
+	body := []byte(`{"code":200,"message":"success","data":{"proxies":["115.78.135.4:3334","165.225.240.12:30001","18.142.95.213:27142"],"count":3}}`)
+	got := parseProxyBody(body)
+	if len(got) != 3 {
+		t.Fatalf("got %d proxies, want 3: %v", len(got), got)
+	}
+	if got[0] != "115.78.135.4:3334" {
+		t.Errorf("first = %q", got[0])
+	}
+}
+
+func TestParseProxyBodyPlainText(t *testing.T) {
+	body := []byte("1.2.3.4:8080\n5.6.7.8:3128\n\n# comment\n")
+	got := parseProxyBody(body)
+	if len(got) != 3 {
+		t.Fatalf("got %d lines, want 3: %v", len(got), got)
+	}
+}
+
+func TestParseProxyBodyIPPortObjects(t *testing.T) {
+	body := []byte(`[{"ip":"1.2.3.4","port":8080},{"ip":"5.6.7.8","port":"3128"}]`)
+	got := parseProxyBody(body)
+	if len(got) != 2 || got[0] != "1.2.3.4:8080" || got[1] != "5.6.7.8:3128" {
+		t.Fatalf("got %v", got)
+	}
+}
+
+// TestSchemeForSource guards against reading the listing's own https:// scheme
+// as the proxy protocol — that would mislabel every HTTPS-hosted list.
+func TestSchemeForSource(t *testing.T) {
+	cases := map[string]string{
+		"https://proxy.scdn.io/api/get_proxy.php?protocol=socks5&count=20":              "socks5",
+		"https://proxy.scdn.io/api/get_proxy.php?protocol=http&count=20":                "http",
+		"https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt":        "socks5",
+		"https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt": "http",
+		"https://raw.githubusercontent.com/HankNovic/ProxyClean/main/SOCKS5.txt":        "socks5",
+		"https://example.com/http.txt":                                                  "http",
+	}
+	for in, want := range cases {
+		if got := schemeForSource(in); got != want {
+			t.Errorf("schemeForSource(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

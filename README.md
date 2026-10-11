@@ -176,7 +176,7 @@ docker run -d --name zen-gate -p 127.0.0.1:8787:8787 \
 
 ### 代理是怎么筛出来的
 
-1. **抓取**：并发拉取 12 个公开免费代理列表（内置，可替换），去重后随机抽样；
+1. **抓取**：并发拉取 14 个公开代理列表 / API（内置，可替换），去重后随机抽样；
 2. **测速**：并发对每个候选发起真实请求，默认要求**能访问 zen 上游**才算可用（可在设置里关掉，改成只测通用连通性，更快但可能选到不能用的）；
 3. **排序**：可用的按延迟升序排列，轮换永远优先选最快的；
 4. **测出口**：对通过的节点再问一次「我的出口 IP 是多少」，记下它**真实**的出口地址（见下文"为什么关心出口 IP"）；
@@ -186,14 +186,34 @@ docker run -d --name zen-gate -p 127.0.0.1:8787:8787 \
    - 返回 `429` 的 → 标记"该 IP 额度已耗尽"，不再使用（代理本身是通的，但对我们没用）；
    - 返回 `403` 的 → 标记"被地区/风控拦截"。
 
-内置源清单（第一个是重点）：
+内置源清单：
 
-| 源 | 说明 |
-|---|---|
-| **HankNovic/ProxyClean** | 持续保活 + **国内连通性实测**清洗过的 SOCKS5 专属池，质量最高 |
-| TheSpeedX / monosans / proxifly / ErcinDedeoglu / sunny9577 / mmpx12 / ShiftyTR / roosterkid / prxchk / zloi-user / hookzof | 通用公开 HTTP/SOCKS5 列表，量大但死节点多 |
+| 源 | 类型 | 说明 |
+|---|---|---|
+| HankNovic/ProxyClean | 纯文本 | 持续保活 + 国内连通性实测的清洗 SOCKS5 池 |
+| proxy.scdn.io | **API** | CDN 服务商公益池，每轮随机返回已校验节点 |
+| TheSpeedX / monosans / proxifly / ErcinDedeoglu / sunny9577 / mmpx12 / ShiftyTR / roosterkid / prxchk / zloi-user / hookzof | 纯文本 | 通用公开 HTTP/SOCKS5 列表，量大但死节点多 |
 
-> 免费代理可用率约 **1%～5%**。实测：1500 个候选 → 48 个可用节点（其中 15 个不同出口 IP）。
+**关于 API 型源**：`proxy.scdn.io` 的接口每轮只随机返回 20 个节点，所以在源地址后加 `#repeat=N` 让它连续请求 N 轮并合并结果（片段不会发给服务器）：
+
+```
+https://proxy.scdn.io/api/get_proxy.php?protocol=http&count=20#repeat=5
+https://proxy.scdn.io/api/get_proxy.php?protocol=socks5&count=20#repeat=3
+```
+
+注意**协议要分开请求**（`protocol=http` / `protocol=socks5` 各一条）——用 `protocol=all` 会混入 SOCKS 类型，而按 HTTP 去测 SOCKS 代理只会得到误判。
+
+任何返回 `ip:port` 的接口都能这样接：纯文本逐行、JSON 数组、`{"data":{"proxies":[...]}}`、`[{"ip":..,"port":..}]` 都能解析。
+
+> **实测可用率**（从中国大陆网络访问 zen 上游）：免费代理整体约 **1%～5%**，且波动很大。
+>
+> | 源 | 候选 | 可用 | 可用率 |
+> |---|---|---|---|
+> | ProxyClean（单独） | 103 | 3 | 2.9% |
+> | scdn.io API（单独） | 171 | 3 | 1.8% |
+> | 全部源混合 | 1388 | 48 | 3.5% |
+>
+> 单轮结果受时段与网络状况影响很大（同样的配置有时 11 个、有时 48 个）。**多刷几轮会累积**，可用数比单轮结果更重要。
 
 ### 为什么关心出口 IP
 
