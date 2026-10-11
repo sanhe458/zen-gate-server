@@ -319,7 +319,9 @@ pre{background:#0a0e14;border:1px solid var(--line);border-radius:10px;padding:1
         <span class="mut">请求 429 或整轮探测限额时自动换出口（20 秒内只切一次）</span>
       </div>
       <label>最少可用代理数</label><input type="number" id="pfMin" min="1" max="50" style="width:120px">
-      <div class="hint">低于此数量时后台自动刷新补充</div>
+      <div class="hint">低于此数量时后台提前补充一次</div>
+      <label>自动刷新周期（分钟）</label><input type="number" id="pfRefresh" min="0" max="1440" style="width:120px">
+      <div class="hint">每 N 分钟重新拉取全部源并完整实测一遍（含出口 IP 查重）；填 0 关闭，只手动刷新</div>
 
       <label>每轮测试上限</label><input type="number" id="pfMaxTest" min="50" max="20000" step="50" style="width:140px">
       <div class="hint">每轮从源里随机抽取多少个候选做测速（越大越慢，但更可能找到可用节点）</div>
@@ -944,6 +946,7 @@ function fillPoolForm(){
   $("pfEnabled").checked=!!POOL.enabled;
   $("pfAuto").checked=!!POOL.autoRotate;
   $("pfMin").value=POOL.minUsable??3;
+  $("pfRefresh").value=POOL.refreshMinutes??10;
   $("pfMaxTest").value=POOL.maxTest??1500;
   $("pfConc").value=POOL.concurrency??120;
   $("pfTimeout").value=POOL.timeoutSec??6;
@@ -957,6 +960,7 @@ async function savePool(){
     proxyPoolEnabled:$("pfEnabled").checked,
     proxyPoolAutoRotate:$("pfAuto").checked,
     proxyPoolMinUsable:+$("pfMin").value||undefined,
+    proxyPoolRefreshMinutes:($("pfRefresh").value===""?undefined:Math.max(0,+$("pfRefresh").value)),
     proxyPoolMaxTest:+$("pfMaxTest").value||undefined,
     proxyPoolConcurrency:+$("pfConc").value||undefined,
     proxyPoolTimeoutSec:+$("pfTimeout").value||undefined,

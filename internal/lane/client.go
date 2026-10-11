@@ -82,6 +82,10 @@ type Lane struct {
 	// lane accounts quota per IP, so a fresh IP restores service.
 	// model is the id that was refused, retryAfter the upstream hint (sec).
 	OnQuotaExhausted func(model string, retryAfter int)
+	// OnEgressFailure fires when a live request never reached upstream — the
+	// transport/proxy path is broken. The proxy pool listens here to verify the
+	// current egress and rotate away from a proxy that stopped forwarding.
+	OnEgressFailure func(model string, detail string)
 }
 
 type atomicFlag struct{ v int32 }
@@ -484,6 +488,12 @@ func (l *Lane) Complete(ctx context.Context, req Request, emit func(Chunk)) (Out
 		if uerr.Code == CodeQuota {
 			if hook := l.OnQuotaExhausted; hook != nil {
 				go hook(model, uerr.RetryAfter)
+			}
+		}
+		// connection-level failure: the egress may have died mid-flight
+		if uerr.Egress {
+			if hook := l.OnEgressFailure; hook != nil {
+				go hook(model, uerr.Message)
 			}
 		}
 		// No switch after content reached the caller (it would duplicate

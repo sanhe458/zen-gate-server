@@ -40,31 +40,31 @@ type WindowState struct {
 }
 
 type Config struct {
-	SchemaVersion        int    `json:"schemaVersion"`
-	Port                 int    `json:"port"`
-	ListenHost           string `json:"listenHost,omitempty"` // "" → loopback; "0.0.0.0" exposes the LAN
-	WebUIPassword        string `json:"webuiPassword,omitempty"` // empty → dashboard open to listeners only
-	MainKey              string `json:"mainKey"`
-	AgentKeys            map[string]string `json:"agentKeys"`
+	SchemaVersion int               `json:"schemaVersion"`
+	Port          int               `json:"port"`
+	ListenHost    string            `json:"listenHost,omitempty"`    // "" → loopback; "0.0.0.0" exposes the LAN
+	WebUIPassword string            `json:"webuiPassword,omitempty"` // empty → dashboard open to listeners only
+	MainKey       string            `json:"mainKey"`
+	AgentKeys     map[string]string `json:"agentKeys"`
 	// ShareKeys are the hand-out keys (label → key). They are equivalent to
 	// the main key for auth, but usage is attributed per label so the
 	// 共享 page can show each recipient's own numbers.
 	ShareKeys            map[string]string `json:"shareKeys,omitempty"`
-	DefaultMaxTokens     int    `json:"defaultMaxTokens"`
-	DefaultEffort        string `json:"defaultEffort"`
-	ProbeIntervalMinutes int    `json:"probeIntervalMinutes"`
-	ExposeRegion         bool   `json:"exposeRegion"`
+	DefaultMaxTokens     int               `json:"defaultMaxTokens"`
+	DefaultEffort        string            `json:"defaultEffort"`
+	ProbeIntervalMinutes int               `json:"probeIntervalMinutes"`
+	ExposeRegion         bool              `json:"exposeRegion"`
 	EnabledAgents        map[string]bool   `json:"enabledAgents"`
-	CloseToTray          bool   `json:"closeToTray"`
-	Notifications        bool   `json:"notifications"`
-	UpdateFeed           string `json:"updateFeed"`
-	LastVersion          string `json:"lastVersion,omitempty"`
-	StatsServerURL       string `json:"statsServerUrl,omitempty"`
-	InstallID            string `json:"installId,omitempty"`
-	ProxyMode            string `json:"proxyMode"` // env | system | direct | custom
-	ProxyURL             string `json:"proxyUrl,omitempty"`
-	FailoverEnabled      bool   `json:"failoverEnabled"`
-	FailoverMax          int    `json:"failoverMax"`
+	CloseToTray          bool              `json:"closeToTray"`
+	Notifications        bool              `json:"notifications"`
+	UpdateFeed           string            `json:"updateFeed"`
+	LastVersion          string            `json:"lastVersion,omitempty"`
+	StatsServerURL       string            `json:"statsServerUrl,omitempty"`
+	InstallID            string            `json:"installId,omitempty"`
+	ProxyMode            string            `json:"proxyMode"` // env | system | direct | custom
+	ProxyURL             string            `json:"proxyUrl,omitempty"`
+	FailoverEnabled      bool              `json:"failoverEnabled"`
+	FailoverMax          int               `json:"failoverMax"`
 
 	// --- proxy pool: quota is accounted per IP, so a fresh egress restores
 	// service once the local one is burned. ---
@@ -86,21 +86,25 @@ type Config struct {
 	// (slower, precise) instead of a generic connectivity check (fast, loose).
 	ProxyPoolVerifyUpstream bool `json:"proxyPoolVerifyUpstream"`
 	// ProxyPoolMinUsable triggers a background refresh when the usable count
-	// drops below it.
+	// drops below it (an early top-up between scheduled refreshes).
 	ProxyPoolMinUsable int `json:"proxyPoolMinUsable,omitempty"`
+	// ProxyPoolRefreshMinutes is the scheduled full-refresh period: pull every
+	// listing and re-run the whole test + egress-dedup pass. 0 disables the
+	// timer and leaves refreshing manual.
+	ProxyPoolRefreshMinutes int `json:"proxyPoolRefreshMinutes,omitempty"`
 
 	Window WindowState `json:"window"`
 }
 
 // DayStat aggregates one calendar day.
 type DayStat struct {
-	Requests  int            `json:"requests"`
-	Failed    int            `json:"failed"`
-	Input     int            `json:"input"`
-	Output    int            `json:"output"`
-	Models    map[string]int `json:"models,omitempty"`
-	ModelReqs map[string]int `json:"modelReqs,omitempty"`
-	Agents    map[string]int `json:"agents,omitempty"`
+	Requests  int                  `json:"requests"`
+	Failed    int                  `json:"failed"`
+	Input     int                  `json:"input"`
+	Output    int                  `json:"output"`
+	Models    map[string]int       `json:"models,omitempty"`
+	ModelReqs map[string]int       `json:"modelReqs,omitempty"`
+	Agents    map[string]int       `json:"agents,omitempty"`
 	Shares    map[string]ShareStat `json:"shares,omitempty"`
 }
 
@@ -114,9 +118,9 @@ type ShareStat struct {
 
 // Stats is the persisted usage accounting.
 type Stats struct {
-	Version int                   `json:"version"`
-	Days    map[string]*DayStat   `json:"days"`
-	Recent  []lane.CallRecord     `json:"recent,omitempty"`
+	Version int                 `json:"version"`
+	Days    map[string]*DayStat `json:"days"`
+	Recent  []lane.CallRecord   `json:"recent,omitempty"`
 	mu      sync.Mutex
 	dirty   bool
 }
@@ -286,6 +290,7 @@ func Open() (*Store, error) {
 		cfg.ProxyPoolTimeoutSec = 6
 		cfg.ProxyPoolVerifyUpstream = true
 		cfg.ProxyPoolMinUsable = 3
+		cfg.ProxyPoolRefreshMinutes = 10
 	}
 	// keep the pool numbers sane even if a hand-edited config zeroed them
 	if cfg.ProxyPoolMaxTest <= 0 {
@@ -299,6 +304,10 @@ func Open() (*Store, error) {
 	}
 	if cfg.ProxyPoolMinUsable <= 0 {
 		cfg.ProxyPoolMinUsable = 3
+	}
+	// a negative period is nonsense; 0 is meaningful (scheduled refresh off)
+	if cfg.ProxyPoolRefreshMinutes < 0 {
+		cfg.ProxyPoolRefreshMinutes = 10
 	}
 	if cfg.SchemaVersion == 0 {
 		// first migration to the versioned schema: mature defaults

@@ -1064,3 +1064,69 @@ func readLocalListing(rawURL, defScheme string) ([]proxyCandidate, error) {
 	}
 	return out, nil
 }
+
+// VerifyCurrent re-tests the active egress, which is how a dead proxy is told
+// apart from an upstream blip. Returns true while the tunnel still forwards
+// traffic (so the failure came from upstream), false when it is genuinely gone.
+//
+// Only reachability is judged here, not quota: a 429/403 answer still proves
+// the proxy carried the request, and that case is already handled by the quota
+// path with its own (different) rotation semantics.
+func (p *ProxyPool) VerifyCurrent(ctx context.Context) bool {
+	cur := p.Current()
+	if cur == "" {
+		return true // direct connection: nothing to verify or rotate away from
+	}
+	u, err := neturl.Parse(cur)
+	if err != nil {
+		return false
+	}
+	p.mu.RLock()
+	timeout := p.timeout
+	p.mu.RUnlock()
+	if timeout < 6*time.Second {
+		timeout = 6 * time.Second
+	}
+
+	transport := &http.Transport{
+		Proxy:               http.ProxyURL(u),
+		DisableKeepAlives:   true,
+		MaxIdleConns:        1,
+		IdleConnTimeout:     5 * time.Second,
+		TLSHandshakeTimeout: timeout,
+	}
+	client := &http.Client{Timeout: timeout, Transport: transport}
+	defer client.CloseIdleConnections()
+
+	tctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(tctx, http.MethodGet, UpstreamBase+"/zen/v1/models", nil)
+	if err != nil {
+		return false
+	}
+	for k, v := range GatewayHeaders(SessionForConversation("pool-verify"), MintRequestId(0), false, "application/json") {
+		req.Header.Set(k, v)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false // the tunnel itself is broken
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+	return true
+}
+
+// MarkCurrentDead flags the active proxy as no longer forwarding. Unlike
+// MarkExhausted — which means "reachable but this IP is out of quota" — this
+// means the tunnel is gone, so the entry stops being a rotation candidate until
+// a later refresh re-tests it.
+func (p *ProxyPool) MarkCurrentDead(detail string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byURL[p.current]; ok {
+		e.OK = false
+		e.Detail = detail
+		e.LastTest = time.Now().UnixMilli()
+		e.Failures++
+	}
+}

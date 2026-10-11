@@ -128,7 +128,8 @@ func PostStreamed(ctx context.Context, path string, body map[string]any, session
 		if ctx.Err() != nil {
 			return nil, &UpstreamError{Code: CodeAborted, Message: "cancelled"}
 		}
-		return nil, &UpstreamError{Code: CodeTransport, Message: err.Error()}
+		// never reached upstream: the path itself (proxy included) is broken
+		return nil, &UpstreamError{Code: CodeTransport, Message: err.Error(), Egress: true}
 	}
 	defer resp.Body.Close()
 

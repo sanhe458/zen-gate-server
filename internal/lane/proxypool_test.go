@@ -428,3 +428,145 @@ func TestReadLocalListingJSON(t *testing.T) {
 		t.Errorf("scheme = %q, want socks5", got[0].Scheme)
 	}
 }
+
+// TestEgressFailureHookFiresOnConnectError covers the trigger behind "dead
+// proxy → switch away": a request that never reached upstream must be flagged
+// as an egress failure (distinct from an upstream-side stream cut).
+func TestEgressFailureHookFiresOnConnectError(t *testing.T) {
+	old := UpstreamBase
+	UpstreamBase = "http://127.0.0.1:1" // nothing listens here
+	defer func() { UpstreamBase = old }()
+
+	l := NewLane()
+	l.SetFailover(false, 1)
+	var fired atomic.Int32
+	var detail atomic.Value
+	l.OnEgressFailure = func(model, d string) {
+		fired.Add(1)
+		detail.Store(d)
+	}
+
+	_, uerr := l.Complete(context.Background(), Request{
+		Model:    "mimo-v2.6-flash-free",
+		Messages: []Message{{Role: RoleUser, Parts: []Part{TextPart{Text: "hi"}}}},
+	}, func(Chunk) {})
+
+	if uerr == nil {
+		t.Fatal("expected an error")
+	}
+	if !uerr.Egress {
+		t.Errorf("connection failure not flagged as egress failure: %+v", uerr)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for fired.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if fired.Load() == 0 {
+		t.Fatal("OnEgressFailure did not fire on a connect error")
+	}
+	if d, _ := detail.Load().(string); d == "" {
+		t.Error("hook detail is empty")
+	}
+}
+
+// TestUpstreamStreamCutIsNotEgressFailure keeps an upstream-side cut from being
+// mistaken for a broken proxy — that would rotate for no reason.
+func TestUpstreamStreamCutIsNotEgressFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "text/event-stream")
+		// a clean text answer then a cut stream (no finish token)
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n"))
+	}))
+	defer srv.Close()
+	old := UpstreamBase
+	UpstreamBase = srv.URL
+	defer func() { UpstreamBase = old }()
+
+	l := NewLane()
+	l.SetFailover(false, 1)
+	var fired atomic.Int32
+	l.OnEgressFailure = func(string, string) { fired.Add(1) }
+
+	_, uerr := l.Complete(context.Background(), Request{
+		Model:    "mimo-v2.6-flash-free",
+		Messages: []Message{{Role: RoleUser, Parts: []Part{TextPart{Text: "hi"}}}},
+	}, func(Chunk) {})
+	if uerr != nil && uerr.Egress {
+		t.Errorf("a stream cut was misread as an egress failure: %+v", uerr)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if fired.Load() != 0 {
+		t.Error("OnEgressFailure fired for an upstream-side cut")
+	}
+}
+
+func TestVerifyCurrent(t *testing.T) {
+	var hits atomic.Int32
+	proxySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("content-type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}))
+	defer proxySrv.Close()
+
+	old := UpstreamBase
+	UpstreamBase = "http://example.invalid" // reachable only via the proxy stub
+	defer func() { UpstreamBase = old }()
+
+	pool := NewProxyPool(nil)
+	ctx := context.Background()
+
+	// direct connection: nothing to verify, treat as healthy
+	if !pool.VerifyCurrent(ctx) {
+		t.Error("direct connection should verify true")
+	}
+
+	// reachable proxy: the stub answers for any target
+	pool.mu.Lock()
+	pool.current = proxySrv.URL
+	pool.byURL[proxySrv.URL] = &ProxyEntry{URL: proxySrv.URL, OK: true}
+	pool.mu.Unlock()
+	if !pool.VerifyCurrent(ctx) {
+		t.Error("reachable proxy should verify true")
+	}
+	if hits.Load() == 0 {
+		t.Error("verification did not go through the proxy")
+	}
+
+	// dead proxy: nothing listens
+	pool.mu.Lock()
+	pool.current = "http://127.0.0.1:1"
+	pool.mu.Unlock()
+	if pool.VerifyCurrent(ctx) {
+		t.Error("dead proxy must verify false")
+	}
+}
+
+func TestMarkCurrentDead(t *testing.T) {
+	pool := NewProxyPool(nil)
+	const u = "http://10.0.0.9:8080"
+	pool.mu.Lock()
+	pool.current = u
+	pool.byURL[u] = &ProxyEntry{URL: u, OK: true, LatencyMs: 120}
+	pool.entries = append(pool.entries, pool.byURL[u])
+	pool.mu.Unlock()
+
+	if pool.UsableCount() != 1 {
+		t.Fatalf("setup: UsableCount = %d", pool.UsableCount())
+	}
+	pool.MarkCurrentDead("运行中失效（无法转发）")
+
+	if pool.UsableCount() != 0 {
+		t.Error("dead proxy still counted as usable")
+	}
+	_, entries, _, _, _, _ := pool.Snapshot()
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d", len(entries))
+	}
+	if entries[0].OK {
+		t.Error("entry still marked OK")
+	}
+	if entries[0].Detail != "运行中失效（无法转发）" {
+		t.Errorf("detail = %q", entries[0].Detail)
+	}
+}

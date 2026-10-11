@@ -118,7 +118,7 @@ func main() {
 	// rotate debounce: one request can burn through several failover attempts,
 	// so a burst of 429s must still produce exactly one egress switch.
 	var lastRotate atomic.Int64
-	rotate := func(reason string) {
+	rotate := func(reason string, markPrev bool) {
 		c := st.Config()
 		if !c.ProxyPoolEnabled || !c.ProxyPoolAutoRotate {
 			return
@@ -133,7 +133,7 @@ func main() {
 		}
 		go func() {
 			old := pool.Current()
-			url, err := pool.Rotate(ctx, true) // triggered by a quota refusal
+			url, err := pool.Rotate(ctx, markPrev)
 			if err != nil {
 				logger.Warnf("出口切换失败（%s）：%v", reason, err)
 				return
@@ -156,7 +156,37 @@ func main() {
 			return
 		}
 		logger.Warnf("请求额度不足（%s，Retry-After %ds），尝试切换出口", model, retryAfter)
-		rotate("请求额度不足")
+		rotate("请求额度不足", true)
+	}
+
+	// live egress failure: the request never reached upstream, which in pool
+	// mode usually means the proxy stopped forwarding mid-flight. Verify before
+	// rotating — an upstream blip must not cost a switch — and collapse a burst
+	// of failing requests into a single verification.
+	var verifying atomic.Bool
+	ln.OnEgressFailure = func(model, detail string) {
+		if !st.Config().ProxyPoolEnabled {
+			return
+		}
+		cur := pool.Current()
+		if cur == "" {
+			return // direct connection: not an egress-pool concern
+		}
+		if !verifying.CompareAndSwap(false, true) {
+			return
+		}
+		go func() {
+			defer verifying.Store(false)
+			vctx, vcancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer vcancel()
+			if pool.VerifyCurrent(vctx) {
+				logger.Infof("请求经代理失败（%s），但出口 %s 仍可达 → 判定上游抖动，不切换", model, cur)
+				return
+			}
+			logger.Warnf("出口 %s 已失效（%s），标记失效并切换…", cur, shortDetail(detail))
+			pool.MarkCurrentDead("运行中失效（无法转发）")
+			rotate("代理失效", false) // already marked: do not also flag it as quota-burned
+		}()
 	}
 
 	ln.OnCall = func(rec lane.CallRecord) {
@@ -182,7 +212,7 @@ func main() {
 			logger.Warnf("免费车道整轮 429 限额，探测进入指数退避")
 			// the whole-lane quota wall is the strongest signal that this IP
 			// has nothing left today
-			rotate("整轮探测额度耗尽")
+			rotate("整轮探测额度耗尽", true)
 			return
 		}
 		logger.Infof("模型状态变化: %s %s → %s", model, stateText(from), stateText(to))
@@ -217,8 +247,11 @@ func main() {
 		}
 	}()
 
-	// proxy pool upkeep: a restored snapshot is already usable, so only refill
-	// when the supply is actually short. Rotation itself never blocks on this —
+	// proxy pool upkeep. A restored snapshot is already usable, so the first
+	// pass only tops up when the supply is short. After that a scheduled full
+	// refresh re-pulls every listing and re-runs the complete test +
+	// egress-dedup pass; between scheduled runs a top-up fires early if the
+	// pool drops below the floor. Rotation itself never waits on any of this —
 	// it refills in place when it runs dry.
 	go func() {
 		select {
@@ -226,25 +259,40 @@ func main() {
 			return
 		case <-time.After(20 * time.Second):
 		}
-		check := func() {
+		var lastFull, lastTopUp time.Time
+		topUp := func(reason string) {
 			c := st.Config()
 			if !c.ProxyPoolEnabled {
 				return
 			}
-			if n := pool.UsableCount(); n < c.ProxyPoolMinUsable {
-				logger.Infof("可用代理仅 %d 个（阈值 %d），补充代理池…", n, c.ProxyPoolMinUsable)
+			if n := pool.UsableCount(); n < c.ProxyPoolMinUsable && time.Since(lastTopUp) > 5*time.Minute {
+				logger.Infof("可用代理仅 %d 个（阈值 %d），%s…", n, c.ProxyPoolMinUsable, reason)
+				lastTopUp = time.Now()
 				pool.Refresh(ctx)
 			}
 		}
-		check()
-		t := time.NewTicker(5 * time.Minute)
+		lastFull = time.Now()
+		topUp("启动时补充")
+
+		t := time.NewTicker(time.Minute)
 		defer t.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				check()
+				c := st.Config()
+				if !c.ProxyPoolEnabled {
+					continue
+				}
+				every := time.Duration(c.ProxyPoolRefreshMinutes) * time.Minute
+				if every > 0 && time.Since(lastFull) >= every {
+					logger.Infof("按计划拉取最新代理列表并重新实测（每 %v 一次）…", every)
+					lastFull = time.Now()
+					pool.Refresh(ctx)
+					continue
+				}
+				topUp("提前补充")
 			}
 		}
 	}()
@@ -281,4 +329,13 @@ func quotaNotesFromStore(in map[string]store.QuotaNote) map[string]lane.Throttle
 		out[m] = note
 	}
 	return out
+}
+
+// shortDetail trims a transport error for a one-line log message.
+func shortDetail(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) > 90 {
+		s = s[:90] + "…"
+	}
+	return s
 }

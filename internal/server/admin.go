@@ -259,19 +259,20 @@ func (s *Server) adminState(w http.ResponseWriter) {
 		"stats":       map[string]any{"days": days, "recent": recent},
 		"hasPassword": strings.TrimSpace(cfg.WebUIPassword) != "",
 		"settings": map[string]any{
-			"defaultMaxTokens":     cfg.DefaultMaxTokens,
-			"defaultEffort":        cfg.DefaultEffort,
-			"probeIntervalMinutes": cfg.ProbeIntervalMinutes,
-			"exposeRegion":         cfg.ExposeRegion,
-			"proxyMode":            cfg.ProxyMode,
-			"proxyURL":             cfg.ProxyURL,
-			"failoverEnabled":      cfg.FailoverEnabled,
-			"failoverMax":          cfg.FailoverMax,
-			"listenHost":           cfg.ListenHost,
-			"hasPassword":          strings.TrimSpace(cfg.WebUIPassword) != "",
-			"proxyPoolEnabled":     cfg.ProxyPoolEnabled,
-			"proxyPoolAutoRotate":  cfg.ProxyPoolAutoRotate,
-			"proxyPoolMinUsable":   cfg.ProxyPoolMinUsable,
+			"defaultMaxTokens":        cfg.DefaultMaxTokens,
+			"defaultEffort":           cfg.DefaultEffort,
+			"probeIntervalMinutes":    cfg.ProbeIntervalMinutes,
+			"exposeRegion":            cfg.ExposeRegion,
+			"proxyMode":               cfg.ProxyMode,
+			"proxyURL":                cfg.ProxyURL,
+			"failoverEnabled":         cfg.FailoverEnabled,
+			"failoverMax":             cfg.FailoverMax,
+			"listenHost":              cfg.ListenHost,
+			"hasPassword":             strings.TrimSpace(cfg.WebUIPassword) != "",
+			"proxyPoolEnabled":        cfg.ProxyPoolEnabled,
+			"proxyPoolAutoRotate":     cfg.ProxyPoolAutoRotate,
+			"proxyPoolMinUsable":      cfg.ProxyPoolMinUsable,
+			"proxyPoolRefreshMinutes": cfg.ProxyPoolRefreshMinutes,
 		},
 		"proxyPool":    s.poolSummary(),
 		"probingModel": s.Lane.ProbingModel(),
@@ -348,6 +349,7 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 		ProxyPoolTimeoutSec     *int     `json:"proxyPoolTimeoutSec"`
 		ProxyPoolVerifyUpstream *bool    `json:"proxyPoolVerifyUpstream"`
 		ProxyPoolMinUsable      *int     `json:"proxyPoolMinUsable"`
+		ProxyPoolRefreshMinutes *int     `json:"proxyPoolRefreshMinutes"`
 	}
 	if err := decodeBody(r, &in); err != nil {
 		writeJSON(w, 400, map[string]any{"error": err.Error()})
@@ -473,6 +475,11 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.ProxyPoolMinUsable != nil && *in.ProxyPoolMinUsable > 0 {
 		cfg.ProxyPoolMinUsable = *in.ProxyPoolMinUsable
+		changed = true
+	}
+	// 0 is meaningful here: it turns the scheduled refresh off
+	if in.ProxyPoolRefreshMinutes != nil && *in.ProxyPoolRefreshMinutes >= 0 && *in.ProxyPoolRefreshMinutes <= 1440 {
+		cfg.ProxyPoolRefreshMinutes = *in.ProxyPoolRefreshMinutes
 		changed = true
 	}
 	if s.pool != nil && poolTouched {
@@ -803,6 +810,7 @@ func (s *Server) adminPoolState(w http.ResponseWriter) {
 		"refreshing":     refreshing,
 		"usable":         usable,
 		"minUsable":      cfg.ProxyPoolMinUsable,
+		"refreshMinutes": cfg.ProxyPoolRefreshMinutes,
 		"total":          len(entries),
 		"shown":          len(capped),
 		"entries":        capped,

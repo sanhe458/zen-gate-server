@@ -154,6 +154,11 @@ type UpstreamError struct {
 	// Unavailable marks a gateway refusal that names the model specifically.
 	Unavailable bool
 	RetryAfter  int // seconds, when the gateway supplied one
+	// Egress marks a connection-level failure — the request never reached the
+	// upstream because the transport could not carry it (dial refused, TLS
+	// handshake failed, proxy cut us off). This is what tells a dead proxy
+	// apart from an upstream-side stream cut, which shares the transport code.
+	Egress bool
 }
 
 func (e *UpstreamError) Error() string { return fmt.Sprintf("%s: %s", e.Code, e.Message) }
