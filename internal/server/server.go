@@ -134,28 +134,58 @@ func (s *Server) Stop() {
 	}
 }
 
-// BaseURL is the externally advertised endpoint.
+// BaseURL is the externally advertised endpoint. An unspecified bind has no
+// dialable form of its own (net.Listen reports "[::]"), so loopback is
+// advertised here; the public landing page rebuilds the real address from the
+// request it actually receives.
 func (s *Server) BaseURL() string {
-	if a, ok := s.addr.Load().(string); ok {
-		return "http://" + a + "/v1"
-	}
-	host := s.Store.Config().ListenHost
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	return fmt.Sprintf("http://%s:%d/v1", host, s.Store.Config().Port)
+	return "http://" + s.dialableAddr() + "/v1"
 }
 
-// ListenAddr is the display form of the dashboard origin.
+// ListenAddr is the display form of what the listener is bound to.
 func (s *Server) ListenAddr() string {
 	if a, ok := s.addr.Load().(string); ok {
+		if h, p, err := net.SplitHostPort(a); err == nil {
+			if ip := net.ParseIP(h); ip == nil || !ip.IsUnspecified() {
+				return a
+			}
+			// bound to 0.0.0.0 / :: : report the configured host rather than
+			// the kernel's "[::]" spelling of "everything"
+			if host := strings.TrimSpace(s.Store.Config().ListenHost); host != "" {
+				return net.JoinHostPort(host, p)
+			}
+			return net.JoinHostPort("127.0.0.1", p)
+		}
 		return a
 	}
-	host := s.Store.Config().ListenHost
-	if host == "" {
-		host = "127.0.0.1"
+	return net.JoinHostPort(s.configuredHost(), strconv.Itoa(s.Store.Config().Port))
+}
+
+// dialableAddr is a host:port a client can actually connect to.
+func (s *Server) dialableAddr() string {
+	if a, ok := s.addr.Load().(string); ok {
+		if h, p, err := net.SplitHostPort(a); err == nil {
+			if ip := net.ParseIP(h); ip == nil || !ip.IsUnspecified() {
+				return a
+			}
+			return net.JoinHostPort("127.0.0.1", p)
+		}
+		return a
 	}
-	return net.JoinHostPort(host, strconv.Itoa(s.Store.Config().Port))
+	return net.JoinHostPort(s.configuredHost(), strconv.Itoa(s.Store.Config().Port))
+}
+
+// configuredHost is the host part of the configured bind, normalising an empty
+// or unspecified value to loopback.
+func (s *Server) configuredHost() string {
+	host := strings.TrimSpace(s.Store.Config().ListenHost)
+	if host == "" {
+		return "127.0.0.1"
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsUnspecified() {
+		return "127.0.0.1"
+	}
+	return host
 }
 
 // loopbackListener reports whether the configured bind is loopback-only.
@@ -272,12 +302,12 @@ func (s *Server) agentOf(r *http.Request) string {
 		return ""
 	}
 	for id, k := range cfg.AgentKeys {
-		if k != "" && subtle.ConstantTimeCompare([]byte(key), []byte(k)) == 1 {
+		if k != "" && len(k) == len(key) && subtle.ConstantTimeCompare([]byte(key), []byte(k)) == 1 {
 			return id
 		}
 	}
 	for label, k := range cfg.ShareKeys {
-		if k != "" && subtle.ConstantTimeCompare([]byte(key), []byte(k)) == 1 {
+		if k != "" && len(k) == len(key) && subtle.ConstantTimeCompare([]byte(key), []byte(k)) == 1 {
 			return store.ShareAgentPrefix + label
 		}
 	}

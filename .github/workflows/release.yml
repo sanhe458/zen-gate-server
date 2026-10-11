@@ -20,8 +20,12 @@ jobs:
 
       - name: Verify
         run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; echo "::error::run 'make fmt'"; exit 1; }
           go vet ./...
           go test ./...
+          # the service is highly concurrent (probe loops, proxy pool, stats
+          # writer, dashboard pollers) — keep the race detector in the loop
+          go test -race ./...
 
       - name: Build (linux/amd64)
         run: |

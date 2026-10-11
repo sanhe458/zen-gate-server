@@ -134,24 +134,26 @@ func publicBaseURL(r *http.Request) string {
 		scheme = "https"
 	}
 	host := r.Host
-	if v := r.Header.Get("Forwarded"); v != "" { // RFC 7239, lowest precedence
-		for _, part := range strings.Split(v, ";") {
-			kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
-			if len(kv) != 2 {
-				continue
-			}
-			val := strings.Trim(kv[1], `"`)
-			switch strings.ToLower(kv[0]) {
-			case "proto":
-				scheme = val
-			case "host":
-				host = val
+	// A reverse proxy publishes the original scheme/host in these headers, but
+	// they are only believed when the hop itself is trusted — otherwise any
+	// public caller could rewrite the address the landing page advertises.
+	// RFC 7239's Forwarded is parsed first so X-Forwarded-* keeps precedence.
+	if peer, _, err := net.SplitHostPort(r.RemoteAddr); err == nil && trustedPeer(peer) {
+		if v := r.Header.Get("Forwarded"); v != "" {
+			for _, part := range strings.Split(v, ";") {
+				kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
+				if len(kv) != 2 {
+					continue
+				}
+				val := strings.Trim(kv[1], `"`)
+				switch strings.ToLower(kv[0]) {
+				case "proto":
+					scheme = val
+				case "host":
+					host = val
+				}
 			}
 		}
-	}
-	// A reverse proxy publishes the original scheme/host in these headers.
-	// They are only believed when the hop itself is trusted.
-	if peer, _, err := net.SplitHostPort(r.RemoteAddr); err == nil && trustedPeer(peer) {
 		if p := firstToken(r.Header.Get("X-Forwarded-Proto")); p != "" {
 			scheme = p
 		}

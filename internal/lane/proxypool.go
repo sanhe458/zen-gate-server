@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	neturl "net/url"
 	"os"
@@ -498,7 +499,11 @@ func (p *ProxyPool) testOne(ctx context.Context, url, host, scheme, annotCountry
 		e.Detail = "地址不合法"
 		return e
 	}
+	// Configure() writes p.timeout under p.mu, so read it under the lock too:
+	// a settings save overlapping a refresh is otherwise a data race.
+	p.mu.RLock()
 	timeout := p.timeout
+	p.mu.RUnlock()
 	transport := &http.Transport{
 		Proxy:               http.ProxyURL(u),
 		DisableKeepAlives:   true,
@@ -669,12 +674,41 @@ func normalizeProxy(raw, defScheme string) (url, host, scheme string, ok bool) {
 		return "", "", "", false
 	}
 	// skip obviously invalid hosts
-	if strings.Count(host, ".") != 3 && !strings.Contains(host, "localhost") {
-		if !strings.Contains(host, ":") { // IPv6-ish
-			return "", "", "", false
-		}
+	if !validProxyHost(m[2]) {
+		return "", "", "", false
 	}
 	return scheme + "://" + host, host, scheme, true
+}
+
+// validProxyHost rejects listing lines whose host part cannot be an address.
+// The check has to run on the bare host (m[2]) — testing the composed
+// "host:port" would always see a colon and never reject anything.
+func validProxyHost(h string) bool {
+	h = strings.TrimSpace(h)
+	if h == "" || len(h) > 253 {
+		return false
+	}
+	if net.ParseIP(h) != nil {
+		return true
+	}
+	if strings.EqualFold(h, "localhost") {
+		return true
+	}
+	// a digits-and-dots string must be a real IPv4 literal, otherwise it is
+	// junk ("1.2.3", "999.999.999.999", "0.0.0.0.0")
+	if strings.Trim(h, "0123456789.") == "" {
+		return false
+	}
+	// hostname: needs a dot, and no empty/dangling label
+	if !strings.Contains(h, ".") {
+		return false
+	}
+	if strings.HasPrefix(h, ".") || strings.HasSuffix(h, ".") ||
+		strings.HasPrefix(h, "-") || strings.HasSuffix(h, "-") ||
+		strings.Contains(h, "..") {
+		return false
+	}
+	return true
 }
 
 // proxyFetchUA identifies this service when pulling listings (some CDNs

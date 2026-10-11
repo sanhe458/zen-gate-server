@@ -4,7 +4,7 @@ VERSION  ?= 1.0.0
 LDFLAGS  := -s -w -X main.buildVersion=$(VERSION) -X zen-gate-server/internal/server.Version=$(VERSION)
 GO       ?= go
 
-.PHONY: all build run test vet fmt clean release docker help
+.PHONY: all build run test race vet fmt clean release docker help
 
 all: vet test build ## 默认：检查 + 测试 + 构建
 
@@ -18,6 +18,9 @@ run: ## 前台运行（本机 127.0.0.1:8787 调试用）
 
 test: ## 运行单元测试
 	$(GO) test ./...
+
+race: ## 竞态检测（并发路径多，建议提交前跑一遍）
+	$(GO) test -race ./...
 
 vet: ## 静态检查
 	$(GO) vet ./...

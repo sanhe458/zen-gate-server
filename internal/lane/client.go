@@ -3,6 +3,7 @@ package lane
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -88,16 +89,14 @@ type Lane struct {
 	OnEgressFailure func(model string, detail string)
 }
 
-type atomicFlag struct{ v int32 }
+// atomicFlag is a real atomic boolean. ProbeRound is reachable from several
+// goroutines at once (probe ticker, egress watcher, /admin reprobe, the rotate
+// hook), so the guard must genuinely be atomic — a plain int32 would be a data
+// race and could let two probe rounds run at the same time.
+type atomicFlag struct{ v atomic.Bool }
 
-func (f *atomicFlag) Set(b bool) {
-	if b {
-		f.v = 1
-	} else {
-		f.v = 0
-	}
-}
-func (f *atomicFlag) Get() bool { return f.v == 1 }
+func (f *atomicFlag) Set(b bool) { f.v.Store(b) }
+func (f *atomicFlag) Get() bool  { return f.v.Load() }
 
 // NewLane seeds the lane with the fallback catalog.
 func NewLane() *Lane {
@@ -476,6 +475,12 @@ func (l *Lane) Complete(ctx context.Context, req Request, emit func(Chunk)) (Out
 	failovers := 0
 	tried := map[string]bool{requested: true}
 	for {
+		// Tell the caller which model this attempt will use, before any byte
+		// of the response is produced — the gateway uses it to stamp the
+		// served-by header while the header can still be written.
+		if req.OnAttempt != nil {
+			req.OnAttempt(model)
+		}
 		out, uerr, sawAny := l.attemptModel(ctx, req, model, effort, emit)
 		out.ServedModel = model
 		out.Failovers = failovers

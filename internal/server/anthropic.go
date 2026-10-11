@@ -12,19 +12,19 @@ import (
 // Anthropic /v1/messages, for Claude-protocol clients (Claude Code and kin).
 
 type anthropicContentBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type   string `json:"type"`
+	Text   string `json:"text"`
 	Source *struct {
 		Type      string `json:"type"`
 		MediaType string `json:"media_type"`
 		Data      string `json:"data"`
 	} `json:"source"`
-	ID      string          `json:"id"`
-	Name    string          `json:"name"`
-	Input   json.RawMessage `json:"input"`
-	ToolUseID string        `json:"tool_use_id"`
-	Content json.RawMessage `json:"content"`
-	IsError bool            `json:"is_error"`
+	ID        string          `json:"id"`
+	Name      string          `json:"name"`
+	Input     json.RawMessage `json:"input"`
+	ToolUseID string          `json:"tool_use_id"`
+	Content   json.RawMessage `json:"content"`
+	IsError   bool            `json:"is_error"`
 }
 
 type anthropicMessage struct {
@@ -39,17 +39,17 @@ type anthropicToolDef struct {
 }
 
 type anthropicRequest struct {
-	Model     string               `json:"model"`
-	MaxTokens int                  `json:"max_tokens"`
-	System    json.RawMessage      `json:"system"`
-	Messages  []anthropicMessage   `json:"messages"`
-	Tools     []anthropicToolDef   `json:"tools"`
-	Stream    bool                 `json:"stream"`
+	Model     string             `json:"model"`
+	MaxTokens int                `json:"max_tokens"`
+	System    json.RawMessage    `json:"system"`
+	Messages  []anthropicMessage `json:"messages"`
+	Tools     []anthropicToolDef `json:"tools"`
+	Stream    bool               `json:"stream"`
 	Thinking  *struct {
 		Type         string `json:"type"`
 		BudgetTokens int    `json:"budget_tokens"`
 	} `json:"thinking"`
-	Metadata  *struct {
+	Metadata *struct {
 		UserID string `json:"user_id"`
 	} `json:"metadata"`
 }
@@ -138,6 +138,12 @@ type anthropicStreamState struct {
 	index    int
 	blockMap map[int]int // lane block index → anthropic block index
 	sawAny   bool
+	// start emits message_start — and stamps x-zen-gate-served-by — lazily,
+	// on the first chunk, so the header names the model that actually served
+	// the turn (the first attempt may be failing over).
+	start   func()
+	started bool
+	model   string
 }
 
 func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
@@ -184,7 +190,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		outcome, uerr := s.Lane.Complete(ctx, lane.Request{
 			Model: model, Effort: effort, Messages: unified, Tools: tools,
 			MaxTokens: req.MaxTokens, SessionSeed: seed, TurnSeed: turn,
-			Agent:       agent,
+			Agent: agent,
 		}, collector.consume)
 		served := servedModel(outcome, base)
 		if uerr != nil && !collector.hasAnything() {
@@ -204,15 +210,28 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	}
 	st.sse = sse
 	msgID := randomID("msg_")
-	sse.event(map[string]any{"type": "message_start", "message": map[string]any{
-		"id": msgID, "type": "message", "role": "assistant", "model": base,
-		"content": []any{}, "stop_sequence": nil, "stop_reason": nil,
-		"usage": map[string]any{"input_tokens": 0, "output_tokens": 0}}})
+	st.model = base
+	// message_start is held back until the first chunk (or until the turn is
+	// known to have succeeded): writing it first would commit the response
+	// before we know which model is serving it, and x-zen-gate-served-by could
+	// never be set.
+	st.start = func() {
+		if st.started {
+			return
+		}
+		st.started = true
+		w.Header().Set("x-zen-gate-served-by", st.model)
+		st.sse.event(map[string]any{"type": "message_start", "message": map[string]any{
+			"id": msgID, "type": "message", "role": "assistant", "model": st.model,
+			"content": []any{}, "stop_sequence": nil, "stop_reason": nil,
+			"usage": map[string]any{"input_tokens": 0, "output_tokens": 0}}})
+	}
 
 	outcome, uerr := s.Lane.Complete(ctx, lane.Request{
 		Model: model, Effort: effort, Messages: unified, Tools: tools,
 		MaxTokens: req.MaxTokens, SessionSeed: seed, TurnSeed: turn,
-			Agent:       agent,
+		Agent:     agent,
+		OnAttempt: func(m string) { st.model = m },
 	}, st.consume)
 	stop := "end_turn"
 	switch {
@@ -225,6 +244,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		sse.event(map[string]any{"type": "error", "error": map[string]any{"type": errorType(uerr), "message": uerr.Message}})
 		return
 	}
+	st.start()
 	sse.event(map[string]any{"type": "message_delta",
 		"delta": map[string]any{"stop_reason": stop, "stop_sequence": nil},
 		"usage": map[string]any{"output_tokens": outcome.Usage.Output}})
@@ -233,6 +253,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 
 func (st *anthropicStreamState) consume(c lane.Chunk) {
 	st.sawAny = true
+	st.start()
 	switch c.Kind {
 	case lane.ChunkBlockStart:
 		idx := st.index
@@ -250,16 +271,27 @@ func (st *anthropicStreamState) consume(c lane.Chunk) {
 				"content_block": map[string]any{"type": "tool_use", "id": c.ID, "name": c.Name, "input": json.RawMessage("{}")}})
 		}
 	case lane.ChunkTextDelta:
-		st.sse.event(map[string]any{"type": "content_block_delta", "index": st.blockMap[c.Index],
-			"delta": map[string]any{"type": "text_delta", "text": c.Delta}})
+		if idx, ok := st.blockMap[c.Index]; ok {
+			st.sse.event(map[string]any{"type": "content_block_delta", "index": idx,
+				"delta": map[string]any{"type": "text_delta", "text": c.Delta}})
+		}
 	case lane.ChunkReasonDelta:
-		st.sse.event(map[string]any{"type": "content_block_delta", "index": st.blockMap[c.Index],
-			"delta": map[string]any{"type": "thinking_delta", "thinking": c.Delta}})
+		if idx, ok := st.blockMap[c.Index]; ok {
+			st.sse.event(map[string]any{"type": "content_block_delta", "index": idx,
+				"delta": map[string]any{"type": "thinking_delta", "thinking": c.Delta}})
+		}
 	case lane.ChunkToolCallDelta:
-		st.sse.event(map[string]any{"type": "content_block_delta", "index": st.blockMap[c.Index],
-			"delta": map[string]any{"type": "input_json_delta", "partial_json": c.Delta}})
+		if idx, ok := st.blockMap[c.Index]; ok {
+			st.sse.event(map[string]any{"type": "content_block_delta", "index": idx,
+				"delta": map[string]any{"type": "input_json_delta", "partial_json": c.Delta}})
+		}
 	case lane.ChunkBlockEnd:
-		st.sse.event(map[string]any{"type": "content_block_stop", "index": st.blockMap[c.Index]})
+		// Only emit for a block we actually opened: a delta/stop whose index
+		// was never started would otherwise be reported as block 0.
+		if idx, ok := st.blockMap[c.Index]; ok {
+			st.sse.event(map[string]any{"type": "content_block_stop", "index": idx})
+			delete(st.blockMap, c.Index)
+		}
 	}
 }
 
@@ -290,7 +322,7 @@ func anthropicResponse(id, model string, c *responsesCollector, outcome lane.Out
 	}
 	return map[string]any{
 		"id": id, "type": "message", "role": "assistant", "model": model,
-		"content":    content,
+		"content":     content,
 		"stop_reason": stop, "stop_sequence": nil,
 		"usage": map[string]any{
 			"input_tokens":  outcome.Usage.Input + outcome.Usage.CacheRead,

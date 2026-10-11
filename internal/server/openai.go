@@ -21,23 +21,23 @@ type openaiContentPart struct {
 }
 
 type openaiToolCall struct {
-	ID        string `json:"id"`
-	Type      string `json:"type"`
-	Function  struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	} `json:"function"`
 }
 
 type openaiMessage struct {
-	Role       string          `json:"role"`
-	Content    json.RawMessage `json:"content"`
+	Role       string           `json:"role"`
+	Content    json.RawMessage  `json:"content"`
 	ToolCalls  []openaiToolCall `json:"tool_calls"`
-	ToolCallID string          `json:"tool_call_id"`
+	ToolCallID string           `json:"tool_call_id"`
 }
 
 type openaiToolDef struct {
-	Type string `json:"type"`
+	Type     string `json:"type"`
 	Function *struct {
 		Name        string          `json:"name"`
 		Description string          `json:"description"`
@@ -49,14 +49,14 @@ type openaiToolDef struct {
 }
 
 type openaiChatRequest struct {
-	Model               string           `json:"model"`
-	Messages            []openaiMessage  `json:"messages"`
-	Tools               []openaiToolDef  `json:"tools"`
-	Stream              bool             `json:"stream"`
-	MaxTokens           int              `json:"max_tokens"`
-	MaxCompletionTokens int              `json:"max_completion_tokens"`
-	ReasoningEffort     string           `json:"reasoning_effort"`
-	User                string           `json:"user"`
+	Model               string          `json:"model"`
+	Messages            []openaiMessage `json:"messages"`
+	Tools               []openaiToolDef `json:"tools"`
+	Stream              bool            `json:"stream"`
+	MaxTokens           int             `json:"max_tokens"`
+	MaxCompletionTokens int             `json:"max_completion_tokens"`
+	ReasoningEffort     string          `json:"reasoning_effort"`
+	User                string          `json:"user"`
 	StreamOptions       *struct {
 		IncludeUsage bool `json:"include_usage"`
 	} `json:"stream_options"`
@@ -281,6 +281,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 500, openaiError(err.Error(), "internal_error"))
 		return
 	}
+	// Nothing may be written until we know which model is going to serve the
+	// turn: once the first byte is out, x-zen-gate-served-by can no longer be
+	// set. The opening role frame is therefore held back until the first
+	// attempt is announced or the first chunk arrives.
+	attempted := base
+	started := false
 	sendChunk := func(delta map[string]any, finish any, usage any) {
 		choice := map[string]any{"index": 0, "delta": delta, "finish_reason": finish}
 		payload := map[string]any{
@@ -292,13 +298,24 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		sse.event(payload)
 	}
-	sendChunk(map[string]any{"role": "assistant", "content": ""}, nil, nil)
+	start := func() {
+		if started {
+			return
+		}
+		started = true
+		w.Header().Set("x-zen-gate-served-by", attempted)
+		sendChunk(map[string]any{"role": "assistant", "content": ""}, nil, nil)
+	}
 
 	outcome, uerr := s.Lane.Complete(ctx, lane.Request{
 		Model: model, Effort: effort, Messages: unified,
 		Tools: convertOpenAITools(req.Tools), MaxTokens: maxTok,
 		SessionSeed: seed, TurnSeed: turn, Agent: agent,
+		// the model this attempt will use — the served-by header is only
+		// stamped on the first attempt that actually produces output
+		OnAttempt: func(m string) { attempted = m },
 	}, func(c lane.Chunk) {
+		start()
 		for _, d := range emit.stream(c) {
 			sendChunk(d.delta, nil, nil)
 		}
@@ -307,7 +324,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if uerr != nil && !emit.hasAny() {
 		setRetryAfter(w, uerr)
 		body := openaiError(uerr.Message, errorType(uerr))
-		if uerr.Code == lane.CodeQuota {
+		if uerr.Code == lane.CodeQuota || uerr.Unavailable {
 			body = withSuggestions(body, s.Lane.Candidates(base, 3))
 		}
 		writeJSON(w, errorStatus(uerr), body)
@@ -315,11 +332,13 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	if uerr != nil {
 		// mid-stream failure after content went out: report as an SSE error
+		start()
 		sse.event(map[string]any{"error": map[string]any{
 			"message": uerr.Message, "type": errorType(uerr), "code": uerr.Code}})
 		sse.done()
 		return
 	}
+	start()
 	finish := "stop"
 	if outcome.Finish == "" {
 		finish = "length" // a cut stream is not a clean stop
@@ -417,8 +436,8 @@ func (e *chatEmitter) consume(c lane.Chunk, text, reasoning *strings.Builder, to
 			delete(e.openTool, c.Index)
 			if !buf.suppressed {
 				*toolCalls = append(*toolCalls, map[string]any{
-					"id":   buf.id,
-					"type": "function",
+					"id":       buf.id,
+					"type":     "function",
 					"function": map[string]any{"name": buf.name, "arguments": buf.args},
 				})
 			}
@@ -554,13 +573,13 @@ type responsesRequest struct {
 }
 
 type responsesItem struct {
-	Type    string          `json:"type"`
-	Role    string          `json:"role,omitempty"`
-	Content json.RawMessage `json:"content,omitempty"`
-	CallID  string          `json:"call_id,omitempty"`
-	Name    string          `json:"name,omitempty"`
-	Arguments string        `json:"arguments,omitempty"`
-	Output  string          `json:"output,omitempty"`
+	Type      string          `json:"type"`
+	Role      string          `json:"role,omitempty"`
+	Content   json.RawMessage `json:"content,omitempty"`
+	CallID    string          `json:"call_id,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	Arguments string          `json:"arguments,omitempty"`
+	Output    string          `json:"output,omitempty"`
 }
 
 func convertResponsesInput(raw json.RawMessage, instructions string) []lane.Message {
@@ -632,18 +651,22 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		Model: model, Effort: effort, Messages: unified,
 		Tools: convertOpenAITools(req.Tools), MaxTokens: req.MaxOutputTokens,
 		SessionSeed: seed, TurnSeed: turn,
-			Agent:       agent,
+		Agent: agent,
 	}, collector.consume)
 	served := servedModel(outcome, base)
 	if uerr != nil && !collector.hasAnything() {
 		setRetryAfter(w, uerr)
 		body := openaiError(uerr.Message, errorType(uerr))
-		if uerr.Code == lane.CodeQuota {
+		if uerr.Code == lane.CodeQuota || uerr.Unavailable {
 			body = withSuggestions(body, s.Lane.Candidates(base, 3))
 		}
 		writeJSON(w, errorStatus(uerr), body)
 		return
 	}
+	// The whole turn is buffered, so nothing has been written yet and the
+	// served-by header is still settable — on both the streaming and the
+	// buffered path.
+	w.Header().Set("x-zen-gate-served-by", served)
 	if req.Stream {
 		s.writeResponsesEvents(w, served, collector, outcome)
 	} else {

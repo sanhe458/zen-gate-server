@@ -20,8 +20,8 @@ type Entry struct {
 }
 
 const (
-	ringSize  = 1000
-	keepDays  = 7
+	ringSize   = 1000
+	keepDays   = 7
 	timeLayout = "2006-01-02 15:04:05.000"
 )
 

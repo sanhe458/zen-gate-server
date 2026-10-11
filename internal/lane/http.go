@@ -37,6 +37,15 @@ func ClassifyFailure(status int, payload string, retryAfterSec int) *UpstreamErr
 		if e.RetryAfter == 0 {
 			e.RetryAfter = 60
 		}
+	// A payload that names the model as unsupported/unknown is a per-model
+	// verdict, not a credential problem — the gateway delivers it under 401
+	// (observed) as well as 400/404. Check it before the status codes, or the
+	// 401 branch below would swallow it: the model would be reported to the
+	// client as a bogus authentication error and a healthy model would never
+	// be failed over to.
+	case status >= 400 && status < 500 && modelErrRe.MatchString(payload):
+		e.Code = CodeServer
+		e.Unavailable = true
 	case status == 401 || status == 403:
 		e.Code = CodeCredential
 	case status >= 500:
@@ -279,13 +288,14 @@ type streamReader struct {
 	src     io.Reader
 	closed  atomic.Bool
 	once    sync.Once
+	done    chan struct{} // closed by Close; unblocks the pump goroutine
 	mu      sync.Mutex
 	pending []byte
 	idle    time.Duration
 }
 
 func newStreamReader(ctx context.Context, src io.Reader, idle time.Duration) *streamReader {
-	s := &streamReader{ch: make(chan streamChunk, 512), src: src, idle: idle}
+	s := &streamReader{ch: make(chan streamChunk, 512), src: src, idle: idle, done: make(chan struct{})}
 	go func() {
 		buf := make([]byte, 32*1024)
 		for {
@@ -293,13 +303,15 @@ func newStreamReader(ctx context.Context, src io.Reader, idle time.Duration) *st
 			if k > 0 {
 				cp := make([]byte, k)
 				copy(cp, buf[:k])
-				s.ch <- streamChunk{cp, nil}
+				if !s.send(streamChunk{cp, nil}) {
+					return
+				}
 			}
 			if err != nil {
 				if err == io.EOF {
-					s.ch <- streamChunk{nil, io.EOF}
+					s.send(streamChunk{nil, io.EOF})
 				} else {
-					s.ch <- streamChunk{nil, err}
+					s.send(streamChunk{nil, err})
 				}
 				return
 			}
@@ -315,9 +327,22 @@ func newStreamReader(ctx context.Context, src io.Reader, idle time.Duration) *st
 	return s
 }
 
+// send hands one chunk to the consumer, giving up as soon as the reader is
+// closed. A bare `s.ch <-` would block forever once the consumer stopped
+// reading (e.g. after an idle timeout) and leak this goroutine.
+func (s *streamReader) send(c streamChunk) bool {
+	select {
+	case s.ch <- c:
+		return true
+	case <-s.done:
+		return false
+	}
+}
+
 func (s *streamReader) Close() {
 	s.once.Do(func() {
 		s.closed.Store(true)
+		close(s.done)
 		if c, ok := s.src.(io.Closer); ok {
 			_ = c.Close()
 		}
@@ -406,9 +431,15 @@ func readSSE(r io.Reader, onData func([]byte) error) (*Usage, error) {
 		var frame map[string]any
 		if json.Unmarshal([]byte(payload), &frame) == nil {
 			if u := mapUsage(frame); u != nil {
-				if usage == nil {
+				switch {
+				case usage == nil:
 					usage = u
-				} else {
+				case jsonString(frame["type"]) == "message_delta":
+					// Anthropic's terminal message_delta repeats the
+					// *cumulative* output count, so it overrides the seed that
+					// message_start already reported instead of adding to it.
+					usage.Override(u)
+				default:
 					usage.Merge(u)
 				}
 			}
@@ -498,6 +529,31 @@ func (u *Usage) Merge(o *Usage) {
 	u.CacheRead += o.CacheRead
 	u.CacheWrite += o.CacheWrite
 	u.TotalTokens += o.TotalTokens
+}
+
+// Override folds in a cumulative (terminal) usage frame: every counter the
+// frame actually carries replaces the accumulated value rather than adding to
+// it, which is what a "this is the final total" frame means.
+func (u *Usage) Override(o *Usage) {
+	if o == nil {
+		return
+	}
+	if o.Input != 0 {
+		u.Input = o.Input
+	}
+	if o.Output != 0 {
+		u.Output = o.Output
+	}
+	if o.Reasoning != 0 {
+		u.Reasoning = o.Reasoning
+	}
+	if o.CacheRead != 0 {
+		u.CacheRead = o.CacheRead
+	}
+	if o.CacheWrite != 0 {
+		u.CacheWrite = o.CacheWrite
+	}
+	u.TotalTokens = u.Input + u.Output
 }
 
 func jsonString(v any) string {

@@ -607,8 +607,8 @@ function renderRecent(){
 }
 
 /* ---------- models ---------- */
-const stateCls={available:"av",throttled:"th",region_block:"rg",unknown:"uk",unavailable:"un"};
-const stateTxt={available:"可用",throttled:"已限额",region_block:"地区受限",unknown:"未探测",unavailable:"不可用"};
+const stateCls={available:"av",throttled:"th","region-blocked":"rg",unknown:"uk",unavailable:"un"};
+const stateTxt={available:"可用",throttled:"已限额","region-blocked":"地区受限",unknown:"未探测",unavailable:"不可用"};
 function renderModels(){
   if(!S)return;
   const m=S.models||[];

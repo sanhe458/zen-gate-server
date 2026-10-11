@@ -258,6 +258,15 @@ func Open() (*Store, error) {
 	if cfg.ProxyMode == "" {
 		cfg.ProxyMode = "env"
 	}
+	// Schema migrations. Every gate bumps SchemaVersion, so they must be
+	// evaluated in ascending order — a `< 4` gate placed after a `< 5` gate can
+	// never fire, because the version is already past it.
+	if cfg.SchemaVersion == 0 {
+		// first migration to the versioned schema: mature defaults
+		cfg.SchemaVersion = 1
+		cfg.CloseToTray = true
+		cfg.Notifications = true
+	}
 	// v2: failover ships enabled; the version gate keeps an explicitly
 	// disabled setting sticky on later boots.
 	if cfg.SchemaVersion < 2 {
@@ -280,17 +289,6 @@ func Open() (*Store, error) {
 		b := make([]byte, 12)
 		_, _ = rand.Read(b)
 		cfg.InstallID = hex.EncodeToString(b)
-	}
-	// v5: keyless callers get a metered budget instead of a flat refusal, so
-	// the endpoint can be demoed and lightly used without handing out a key.
-	if cfg.SchemaVersion < 5 {
-		cfg.SchemaVersion = 5
-		if cfg.AnonymousRPM == 0 {
-			cfg.AnonymousRPM = 60
-		}
-	}
-	if cfg.AnonymousRPM < 0 {
-		cfg.AnonymousRPM = 60
 	}
 	// v4: proxy pool. Quota is accounted per IP, so rotating the egress is the
 	// escape hatch once the local connection is burned. Ships with workable
@@ -323,11 +321,16 @@ func Open() (*Store, error) {
 	if cfg.ProxyPoolRefreshMinutes < 0 {
 		cfg.ProxyPoolRefreshMinutes = 10
 	}
-	if cfg.SchemaVersion == 0 {
-		// first migration to the versioned schema: mature defaults
-		cfg.SchemaVersion = 1
-		cfg.CloseToTray = true
-		cfg.Notifications = true
+	// v5: keyless callers get a metered budget instead of a flat refusal, so
+	// the endpoint can be demoed and lightly used without handing out a key.
+	if cfg.SchemaVersion < 5 {
+		cfg.SchemaVersion = 5
+		if cfg.AnonymousRPM == 0 {
+			cfg.AnonymousRPM = 60
+		}
+	}
+	if cfg.AnonymousRPM < 0 {
+		cfg.AnonymousRPM = 60
 	}
 	if cfg.ProbeIntervalMinutes <= 0 {
 		cfg.ProbeIntervalMinutes = 15
@@ -460,12 +463,15 @@ func (s *Store) Save() error {
 // KeyForAgent returns (creating if needed) the stable subkey of one agent.
 func (s *Store) KeyForAgent(agentID string) string {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if k, ok := s.cfg.AgentKeys[agentID]; ok && k != "" {
+		s.mu.Unlock()
 		return k
 	}
 	k := GenerateKey(agentID)
 	s.cfg.AgentKeys[agentID] = k
+	s.mu.Unlock()
+	// Save takes s.mu itself, so it must never be called while it is held:
+	// sync.Mutex is not reentrant and the call would deadlock forever.
 	_ = s.Save()
 	return k
 }
@@ -479,6 +485,17 @@ func (s *Store) Record(rec lane.CallRecord) {
 	if !ok {
 		d = &DayStat{Models: map[string]int{}, Agents: map[string]int{}, Shares: map[string]ShareStat{}}
 		s.stats.Days[day] = d
+	}
+	// A day bucket restored from disk can carry nil maps: every slice field is
+	// `omitempty`, so a bucket whose "agents" was empty when it was written
+	// comes back with a nil map. Allocate the ones we are about to index —
+	// writing into a nil map panics, and that panic lands *after* the upstream
+	// call already succeeded, throwing away a response we were billed for.
+	if d.Models == nil {
+		d.Models = map[string]int{}
+	}
+	if d.Agents == nil {
+		d.Agents = map[string]int{}
 	}
 	d.Requests++
 	if !rec.Ok {
@@ -551,11 +568,41 @@ func (s *Store) SnapshotStats() (map[string]*DayStat, []lane.CallRecord) {
 	days := map[string]*DayStat{}
 	for k, v := range s.stats.Days {
 		clone := *v
+		// Deep-copy the inner maps. The shallow copy alone would hand the
+		// caller the live maps, which it then reads after the lock is released
+		// while Record keeps writing — a data race, and at runtime a possible
+		// unrecoverable "concurrent map read and map write".
+		clone.Models = cloneIntMap(v.Models)
+		clone.ModelReqs = cloneIntMap(v.ModelReqs)
+		clone.Agents = cloneIntMap(v.Agents)
+		clone.Shares = cloneShareStats(v.Shares)
 		days[k] = &clone
 	}
 	recent := make([]lane.CallRecord, len(s.stats.Recent))
 	copy(recent, s.stats.Recent)
 	return days, recent
+}
+
+func cloneIntMap(m map[string]int) map[string]int {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]int, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneShareStats(m map[string]ShareStat) map[string]ShareStat {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]ShareStat, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 // BackupDir is where agent adapters stash pre-injection copies.

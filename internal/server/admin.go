@@ -2,11 +2,10 @@ package server
 
 import (
 	"context"
-	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	_ "embed"
 	"encoding/csv"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -224,16 +223,14 @@ func (s *Server) adminLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 401, map[string]any{"ok": false, "error": "密码错误"})
 }
 
+// subtleCmp compares two secrets without leaking their length or content
+// through timing: both sides are hashed to a fixed size first, then compared
+// in constant time (a raw ConstantTimeCompare on the strings themselves would
+// return early — and leak — whenever the lengths differ).
 func subtleCmp(a, b string) bool {
-	return len(a) == len(b) && hmac.Equal([]byte(a), []byte(b)) ||
-		subtleHash(a) == subtleHash(b)
-}
-
-// subtleHash makes the length-leak-free comparison usable for arbitrary
-// password lengths.
-func subtleHash(s string) string {
-	sum := sha256.Sum256([]byte(s))
-	return hex.EncodeToString(sum[:])
+	ha := sha256.Sum256([]byte(a))
+	hb := sha256.Sum256([]byte(b))
+	return subtle.ConstantTimeCompare(ha[:], hb[:]) == 1
 }
 
 func clientHost(r *http.Request) string {

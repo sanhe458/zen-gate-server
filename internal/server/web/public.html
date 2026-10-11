@@ -194,7 +194,7 @@ async function load(){
 function renderModels(list){
   const tb=$("models");
   if(!list.length){ tb.innerHTML='<tr><td colspan="5" class="mut">暂无可用模型</td></tr>'; return; }
-  const st={available:["可用","av"],throttled:["已限额","th"],region_block:["地区受限","rg"],unknown:["未探测","uk"],unavailable:["不可用","un"]};
+  const st={available:["可用","av"],throttled:["已限额","th"],"region-blocked":["地区受限","rg"],unknown:["未探测","uk"],unavailable:["不可用","un"]};
   tb.innerHTML=list.map(m=>{
     const s=st[m.state]||["未知","uk"];
     const caps=[m.reasoning?"推理":"",m.vision?"视觉":""].filter(Boolean).join(" · ")||"—";
