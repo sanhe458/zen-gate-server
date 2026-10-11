@@ -370,7 +370,9 @@ func (p *ProxyPool) Refresh(ctx context.Context) (tested, passed int, err error)
 		p.save()
 	}()
 
+	fetchStart := time.Now()
 	candidates, fetchErr := fetchProxyList(ctx, sources, p.log)
+	fetchDur := time.Since(fetchStart)
 	if len(candidates) == 0 {
 		if fetchErr != nil {
 			p.lastErrSet(fetchErr)
@@ -418,6 +420,7 @@ func (p *ProxyPool) Refresh(ctx context.Context) (tested, passed int, err error)
 	results := make([]*ProxyEntry, 0, len(candidates))
 	var okCount, exhaustedCount int
 
+	testStart := time.Now()
 	seenURL := map[string]bool{}
 	for _, cand := range candidates {
 		u, host, scheme, ok := normalizeProxy(cand.Raw, cand.Scheme)
@@ -469,7 +472,10 @@ func (p *ProxyPool) Refresh(ctx context.Context) (tested, passed int, err error)
 	p.mu.Unlock()
 	p.apply()
 
-	p.log("代理池刷新完成：测试 %d 个，可用 %d 个（其中 %d 个额度已耗尽）", len(results), okCount, exhaustedCount)
+	p.log("代理池刷新完成：测试 %d 个，可用 %d 个（其中 %d 个额度已耗尽）｜抓取 %s + 测速 %s = 共 %s",
+		len(results), okCount, exhaustedCount,
+		fetchDur.Round(time.Millisecond), time.Since(testStart).Round(time.Millisecond),
+		time.Since(fetchStart).Round(time.Millisecond))
 	return len(results), okCount, nil
 }
 
