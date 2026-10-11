@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	neturl "net/url"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -376,5 +378,53 @@ func TestSchemeForSource(t *testing.T) {
 		if got := schemeForSource(in); got != want {
 			t.Errorf("schemeForSource(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// TestReadLocalListing covers file:// sources — the escape hatch for listings
+// that cannot be fetched programmatically (a site behind a Cloudflare
+// challenge, an authenticated panel, a hand-picked list).
+func TestReadLocalListing(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "list.txt")
+	content := "1.2.3.4:8080\n5.6.7.8:3128 #us\n\n# comment line\n9.9.9.9:1080\n1.2.3.4:8080\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := readLocalListing("file://"+path, "http")
+	if err != nil {
+		t.Fatalf("readLocalListing: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d candidates, want 3 (dup dropped, comment skipped): %+v", len(got), got)
+	}
+	if got[0].Raw != "1.2.3.4:8080" || got[0].Scheme != "http" {
+		t.Errorf("first = %+v", got[0])
+	}
+	if got[1].Country != "us" {
+		t.Errorf("country annotation lost: %+v", got[1])
+	}
+}
+
+func TestReadLocalListingMissingFile(t *testing.T) {
+	if _, err := readLocalListing("file:///nonexistent/xyz.txt", "http"); err == nil {
+		t.Error("expected an error for a missing file")
+	}
+}
+
+func TestReadLocalListingJSON(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "list.json")
+	body := `{"code":200,"data":{"proxies":["10.0.0.1:3128","10.0.0.2:8080"]}}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readLocalListing("file://"+path, "socks5")
+	if err != nil || len(got) != 2 {
+		t.Fatalf("got %d, err %v", len(got), err)
+	}
+	if got[0].Scheme != "socks5" {
+		t.Errorf("scheme = %q, want socks5", got[0].Scheme)
 	}
 }

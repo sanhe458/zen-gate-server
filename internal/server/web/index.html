@@ -335,7 +335,11 @@ pre{background:#0a0e14;border:1px solid var(--line);border-radius:10px;padding:1
       <div class="full">
         <textarea id="pfSources" rows="8" spellcheck="false"
           style="width:100%;max-width:820px;background:var(--bg);border:1px solid var(--line);color:var(--tx);border-radius:7px;padding:9px 11px;font-family:var(--mono);font-size:12px;line-height:1.6"></textarea>
-        <div class="mut" style="margin-top:6px">每行一个纯文本代理列表地址（ip:port 或 scheme://ip:port）；留空则使用内置源</div>
+        <div class="mut" style="margin-top:6px;line-height:1.8">
+          每行一个源；留空 = 使用内置源。<br>
+          支持三种形式：<code>https://…</code> 列表或 API（<code>#repeat=N</code> 多轮累积）、<code>file:///路径</code> 本地文件<br>
+          列表内容为 <code>ip:port</code> 或 <code>scheme://ip:port</code>，可带行尾 <code>#国家码</code> 标注
+        </div>
       </div>
     </div>
     <div class="savebar">

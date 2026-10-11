@@ -10,6 +10,7 @@ import (
 	"net/http"
 	neturl "net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -844,6 +845,14 @@ func fetchOneSource(ctx context.Context, client *http.Client, src string) ([]pro
 	url, repeat := splitRepeat(src)
 	defScheme := schemeForSource(url)
 
+	// file:// sources are how a listing that is not machine-fetchable (a site
+	// behind a Cloudflare challenge, an authenticated panel, a hand-picked
+	// list) still gets used: fetch it however you can, drop it on disk, point
+	// a source at it.
+	if strings.HasPrefix(url, "file://") {
+		return readLocalListing(url, defScheme)
+	}
+
 	seen := map[string]bool{}
 	out := []proxyCandidate{}
 	var lastErr error
@@ -1020,4 +1029,32 @@ func (p *ProxyPool) save() {
 		return
 	}
 	_ = os.Rename(tmp, path)
+}
+
+// readLocalListing loads a proxy list from disk. Accepts "file:///abs/path"
+// and "file://relative/path"; the same parser handles it, so JSON exports and
+// plain text both work, and a trailing "#cc" annotation is honoured.
+func readLocalListing(rawURL, defScheme string) ([]proxyCandidate, error) {
+	path := strings.TrimPrefix(rawURL, "file://")
+	if path == "" {
+		return nil, fmt.Errorf("file:// 源缺少路径")
+	}
+	data, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return nil, err
+	}
+	out := []proxyCandidate{}
+	seen := map[string]bool{}
+	for _, line := range parseProxyBody(data) {
+		addr, note := splitAnnotation(line)
+		if addr == "" || seen[addr] {
+			continue
+		}
+		seen[addr] = true
+		out = append(out, proxyCandidate{Raw: addr, Scheme: defScheme, Country: note})
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("本地文件 %s 中没有可解析的代理", path)
+	}
+	return out, nil
 }

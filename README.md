@@ -205,6 +205,15 @@ https://proxy.scdn.io/api/get_proxy.php?protocol=socks5&count=20#repeat=3
 
 任何返回 `ip:port` 的接口都能这样接：纯文本逐行、JSON 数组、`{"data":{"proxies":[...]}}`、`[{"ip":..,"port":..}]` 都能解析。
 
+**抓不到的源用本地文件接**：有些站（例如 `proxy5.net`）整站套了 Cloudflare JS 挑战，程序化抓取拿不到数据——连真实浏览器都可能卡在挑战页。这类列表可以手动导出成文件，然后用 `file://` 源接入：
+
+```
+file:///var/lib/zen-gate/mylist.txt
+file:///var/lib/zen-gate/proxy5-export.json
+```
+
+支持绝对/相对路径，纯文本与 JSON 同样解析，行尾 `#cc` 国家标注也认。这样任何来源的列表（自建代理、付费服务商面板、浏览器导出的表格）都能进池参与实测。
+
 > **实测可用率**（从中国大陆网络访问 zen 上游）：免费代理整体约 **1%～5%**，且波动很大。
 >
 > | 源 | 候选 | 可用 | 可用率 |
