@@ -28,8 +28,63 @@ import (
 //go:embed web/index.html
 var dashboardHTML []byte
 
+//go:embed web/public.html
+var publicHTML []byte
+
 func decodeBody(r *http.Request, v any) error {
 	return json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20)).Decode(v)
+}
+
+// servePublic serves the outward-facing landing page. It embeds no secrets:
+// the page reconstructs its own endpoint from what the browser actually used,
+// so a domain + TLS front end prints exactly that address.
+func (s *Server) servePublic(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("content-type", "text/html; charset=utf-8")
+	w.Header().Set("cache-control", "no-store")
+	_, _ = w.Write(publicHTML)
+}
+
+// publicModelRow is the non-sensitive slice of a model shown on the public page.
+type publicModelRow struct {
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	State         string `json:"state"`
+	Reasoning     bool   `json:"reasoning"`
+	Vision        bool   `json:"vision"`
+	ContextWindow int    `json:"contextWindow"`
+	MaxOutput     int    `json:"maxOutput"`
+}
+
+// servePublicInfo feeds the landing page. Deliberately unauthenticated and
+// unmetered: it exposes only the model catalogue and the anonymous budget —
+// never a key, a subkey, or an internal identifier. Everything here is also
+// readable from /v1/models, so it reveals nothing new.
+func (s *Server) servePublicInfo(w http.ResponseWriter, r *http.Request) {
+	cat, av, egress := s.Lane.Snapshot()
+	cfg := s.Store.Config()
+	rows := []publicModelRow{}
+	for _, m := range cat {
+		if m.SystemOne {
+			continue // decision model, not usable as a chat endpoint
+		}
+		rows = append(rows, publicModelRow{
+			ID: m.ID, Name: m.Name, State: stateOrDefault(av[m.ID]),
+			Reasoning: m.Reasoning, Vision: m.Vision,
+			ContextWindow: m.ContextWindow, MaxOutput: m.MaxOutput,
+		})
+	}
+	w.Header().Set("cache-control", "no-store")
+	writeJSON(w, 200, map[string]any{
+		"service":      "zen-gate-server",
+		"version":      Version,
+		"prefix":       forwardedPrefix(r),
+		"baseURL":      publicBaseURL(r),
+		"anonymousRPM": cfg.AnonymousRPM,
+		"models":       rows,
+		"egress":       map[string]any{"country": egress.Country},
+		"uptimeSec":    int64(time.Since(startedAt).Seconds()),
+		"serverTime":   time.Now().Format(time.RFC3339),
+	})
 }
 
 // serveDashboard serves the SPA shell. Remote callers without a valid
@@ -330,6 +385,7 @@ func todayTokens(days map[string]*store.DayStat, model string) int {
 func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		Port                 *int    `json:"port"`
+		AnonymousRPM         *int    `json:"anonymousRpm"`
 		ListenHost           *string `json:"listenHost"`
 		WebUIPassword        *string `json:"webuiPassword"`
 		DefaultMaxTokens     *int    `json:"defaultMaxTokens"`
@@ -480,6 +536,11 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 	// 0 is meaningful here: it turns the scheduled refresh off
 	if in.ProxyPoolRefreshMinutes != nil && *in.ProxyPoolRefreshMinutes >= 0 && *in.ProxyPoolRefreshMinutes <= 1440 {
 		cfg.ProxyPoolRefreshMinutes = *in.ProxyPoolRefreshMinutes
+		changed = true
+	}
+	// 0 is meaningful here too: it disables keyless access outright
+	if in.AnonymousRPM != nil && *in.AnonymousRPM >= 0 && *in.AnonymousRPM <= 100000 {
+		cfg.AnonymousRPM = *in.AnonymousRPM
 		changed = true
 	}
 	if s.pool != nil && poolTouched {

@@ -40,12 +40,15 @@ type WindowState struct {
 }
 
 type Config struct {
-	SchemaVersion int               `json:"schemaVersion"`
-	Port          int               `json:"port"`
-	ListenHost    string            `json:"listenHost,omitempty"`    // "" → loopback; "0.0.0.0" exposes the LAN
-	WebUIPassword string            `json:"webuiPassword,omitempty"` // empty → dashboard open to listeners only
-	MainKey       string            `json:"mainKey"`
-	AgentKeys     map[string]string `json:"agentKeys"`
+	SchemaVersion int    `json:"schemaVersion"`
+	Port          int    `json:"port"`
+	ListenHost    string `json:"listenHost,omitempty"`    // "" → loopback; "0.0.0.0" exposes the LAN
+	WebUIPassword string `json:"webuiPassword,omitempty"` // empty → dashboard open to listeners only
+	MainKey       string `json:"mainKey"`
+	// AnonymousRPM is the per-IP requests-per-minute budget for callers that
+	// present no API key. 0 disables keyless access entirely.
+	AnonymousRPM int               `json:"anonymousRpm,omitempty"`
+	AgentKeys    map[string]string `json:"agentKeys"`
 	// ShareKeys are the hand-out keys (label → key). They are equivalent to
 	// the main key for auth, but usage is attributed per label so the
 	// 共享 page can show each recipient's own numbers.
@@ -277,6 +280,17 @@ func Open() (*Store, error) {
 		b := make([]byte, 12)
 		_, _ = rand.Read(b)
 		cfg.InstallID = hex.EncodeToString(b)
+	}
+	// v5: keyless callers get a metered budget instead of a flat refusal, so
+	// the endpoint can be demoed and lightly used without handing out a key.
+	if cfg.SchemaVersion < 5 {
+		cfg.SchemaVersion = 5
+		if cfg.AnonymousRPM == 0 {
+			cfg.AnonymousRPM = 60
+		}
+	}
+	if cfg.AnonymousRPM < 0 {
+		cfg.AnonymousRPM = 60
 	}
 	// v4: proxy pool. Quota is accounted per IP, so rotating the egress is the
 	// escape hatch once the local connection is burned. Ships with workable

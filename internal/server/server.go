@@ -59,6 +59,8 @@ type Server struct {
 	// webKey is a per-process random salt mixed into dashboard session
 	// cookies so tokens never repeat across restarts.
 	webKey []byte
+	// anon meters anonymous /v1 traffic per IP; keyed callers skip it.
+	anon *ipRateLimiter
 }
 
 // SetProxyPool wires the egress pool (nil-safe: the dashboard hides the page
@@ -79,7 +81,7 @@ func (s *Server) SetLogger(l interface {
 func New(l *lane.Lane, st *store.Store) *Server {
 	b := make([]byte, 32)
 	_, _ = rand.Read(b)
-	s := &Server{Lane: l, Store: st, webKey: b}
+	s := &Server{Lane: l, Store: st, webKey: b, anon: newIPRateLimiter(time.Minute)}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.safeRoute)
 	s.mux = mux
@@ -186,31 +188,35 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	case path == "/health":
 		writeJSON(w, 200, map[string]any{"ok": true, "service": "zen-gate-server", "version": Version})
 	case path == "/v1/models" && r.Method == http.MethodGet:
-		if !s.authorized(w, r) {
+		if !s.gate(w, r) {
 			return
 		}
 		s.handleListModels(w, r)
 	case path == "/v1/codex-catalog" && r.Method == http.MethodGet:
 		s.handleCodexCatalog(w, r)
 	case path == "/v1/chat/completions" && r.Method == http.MethodPost:
-		if !s.authorized(w, r) {
+		if !s.gate(w, r) {
 			return
 		}
 		s.handleChatCompletions(w, r)
 	case path == "/v1/responses" && r.Method == http.MethodPost:
-		if !s.authorized(w, r) {
+		if !s.gate(w, r) {
 			return
 		}
 		s.handleResponses(w, r)
 	case path == "/v1/messages" && r.Method == http.MethodPost:
-		if !s.authorized(w, r) {
+		if !s.gate(w, r) {
 			return
 		}
 		s.handleAnthropicMessages(w, r)
 	case path == "/favicon.png":
 		w.Header().Set("content-type", "image/png")
 		_, _ = w.Write(faviconPNG)
-	case path == "" || path == "/" || path == "/admin" || path == "/admin/" || path == "/admin/login":
+	case path == "/public-info.json" && r.Method == http.MethodGet:
+		s.servePublicInfo(w, r)
+	case path == "" || path == "/" || path == "/index.html":
+		s.servePublic(w, r)
+	case path == "/admin" || path == "/admin/" || path == "/admin/login":
 		s.serveDashboard(w, r)
 	case strings.HasPrefix(path, "/admin/api/"):
 		s.handleAdmin(w, r, strings.TrimPrefix(path, "/admin/api/"))
@@ -219,16 +225,37 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// authorized checks the Bearer / x-api-key key against the main key and every
-// agent subkey, returning the caller's label via context-free lookup below.
-func (s *Server) authorized(w http.ResponseWriter, r *http.Request) bool {
+// gate authorises one /v1 request.
+//
+// A valid key passes unrestricted. A caller with no key is still served — the
+// gateway is usable without registration — but metered per IP, and the refusal
+// is a 429 whose body explains how to lift the limit. A key that is present but
+// wrong is always a 401: silently downgrading it to anonymous would turn a
+// typo into a confusing rate limit.
+func (s *Server) gate(w http.ResponseWriter, r *http.Request) bool {
 	key := bearerOf(r)
-	if key == "" {
+	if key != "" {
+		if s.keyMatches(key) {
+			return true // keyed callers are never rate limited
+		}
+		writeJSON(w, 401, openaiError("invalid API key", "authentication_error"))
+		return false
+	}
+
+	limit := s.Store.Config().AnonymousRPM
+	if limit <= 0 {
 		writeJSON(w, 401, openaiError("missing API key", "authentication_error"))
 		return false
 	}
-	if !s.keyMatches(key) {
-		writeJSON(w, 401, openaiError("invalid API key", "authentication_error"))
+	ok, remaining, retryAfter := s.anon.allow(clientIP(r), limit)
+	rateLimitHeaders(w, limit, remaining)
+	if !ok {
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		writeJSON(w, 429, map[string]any{"error": map[string]any{
+			"message": "匿名调用限速 " + strconv.Itoa(limit) + " 次/分钟，请稍后重试，或使用 API Key 解除限制",
+			"type":    "rate_limit_error",
+			"code":    "anonymous_rate_limited",
+		}})
 		return false
 	}
 	return true
@@ -237,6 +264,9 @@ func (s *Server) authorized(w http.ResponseWriter, r *http.Request) bool {
 // agentOf resolves which label a key belongs to ("" = main key / unknown).
 func (s *Server) agentOf(r *http.Request) string {
 	key := bearerOf(r)
+	if key == "" {
+		return "anonymous" // keeps anonymous usage separable in the stats
+	}
 	cfg := s.Store.Config()
 	if subtle.ConstantTimeCompare([]byte(key), []byte(cfg.MainKey)) == 1 {
 		return ""

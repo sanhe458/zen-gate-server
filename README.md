@@ -78,9 +78,10 @@ make release
 
 启动后：
 
-- **API**：`http://127.0.0.1:8787/v1`
-- **WebUI**：`http://127.0.0.1:8787/`（或 `/admin`）
-- **主 API Key**：首次启动自动生成 `ofm-…`，在 WebUI「设置 → API Key」查看或轮换
+- **对外展示页**：`http://127.0.0.1:8787/` —— 直接把这个地址发给别人即可，页面会按对方访问的域名显示对应接入地址
+- **管理台**：`http://127.0.0.1:8787/admin`
+- **API**：`http://127.0.0.1:8787/v1` —— 不带 Key 也能调用（限 60 次/分钟）
+- **主 API Key**：首次启动自动生成 `ofm-…`，在管理台「设置 → API Key」查看或轮换
 
 ### 3. 命令行参数
 
@@ -128,6 +129,42 @@ docker run -d --name zen-gate -p 127.0.0.1:8787:8787 \
 > ⚠️ 绑定 `0.0.0.0` 且未设密码时：`/v1` API 仍受 API Key 保护，但**管理页会拒绝非本机访问**（安全默认）。
 
 ---
+
+## 对外展示页 与 管理台
+
+| 路径 | 内容 | 访问控制 |
+|---|---|---|
+| `/` | 对外展示页：接入地址、调用示例、可用模型 | 公开 |
+| `/admin` | 管理台（总览/模型/代理池/统计/共享/日志/设置/接入） | 回环免密，远程需密码 |
+| `/public-info.json` | 展示页的数据源 | 公开（无任何密钥） |
+
+**接入地址按你实际访问的地址实时生成**——用域名访问就显示域名，用 IP 就显示 IP，HTTPS 访问显示 `https://`。反向代理场景会自动识别（仅当直连来源是回环/内网时才采信 `X-Forwarded-Proto` / `X-Forwarded-Host` / `X-Forwarded-Prefix`，否则公网客户端可以伪造头）。
+
+所以同一份部署，在 `https://api.example.com/` 上打开就显示 `https://api.example.com/v1`，在 `http://127.0.0.1:8787/` 上打开就显示 `http://127.0.0.1:8787/v1`，示例代码、curl、各客户端配置片段全部随之同步。
+
+## 免 Key 调用与限速
+
+`/v1` 允许**不携带 API Key** 直接调用，按来源 IP 限速：
+
+| 调用方式 | 限制 |
+|---|---|
+| 不带 Key | 每 IP **60 次/分钟**（默认，可在管理台调整，填 0 则关闭免 Key 调用） |
+| 带有效 Key | **无限制** |
+| 带错误 Key | `401` —— 不会静默降级成匿名，避免打错字被误读成限速 |
+
+响应头会主动告知预算：`X-RateLimit-Limit`、`X-RateLimit-Remaining`；超限返回 `429` 并附 `Retry-After`：
+
+```json
+{"error":{"code":"anonymous_rate_limited",
+          "message":"匿名调用限速 60 次/分钟，请稍后重试，或使用 API Key 解除限制",
+          "type":"rate_limit_error"}}
+```
+
+用**滑动窗口**而非固定分钟桶：固定桶会让调用方在某一分钟末尾和下一分钟开头各刷满一次，实际速率翻倍。
+
+匿名调用在统计里单独归到 `anonymous`，与主 Key、共享 Key 的用量分开记账。
+
+> **反代部署提醒**：限速依赖真实客户端 IP。本服务只在直连来源是回环或内网地址时才采信 `X-Forwarded-For` / `X-Real-IP`，所以请确保你的反向代理**覆盖**（而不是追加）这些头——例如 Nginx 用 `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` 与 `proxy_set_header Host $host;`。
 
 ## WebUI
 
@@ -429,13 +466,15 @@ codex
 
 | 方法 | 路径 | 认证 | 说明 |
 |---|---|---|---|
+| GET | `/` | 否 | **对外展示页**：接入地址、调用示例、可用模型 |
+| GET | `/public-info.json` | 否 | 展示页数据（只含公开信息，不含任何 Key） |
 | GET | `/health` | 否 | 健康检查（Docker HEALTHCHECK 用） |
-| GET | `/v1/models` | Key | OpenAI 风格模型列表（含力度变体） |
-| POST | `/v1/chat/completions` | Key | OpenAI Chat Completions（流式/非流式） |
-| POST | `/v1/responses` | Key | OpenAI Responses API |
-| POST | `/v1/messages` | Key | Anthropic Messages API |
+| GET | `/v1/models` | Key 或匿名 | OpenAI 风格模型列表（含力度变体） |
+| POST | `/v1/chat/completions` | Key 或匿名 | OpenAI Chat Completions（流式/非流式） |
+| POST | `/v1/responses` | Key 或匿名 | OpenAI Responses API |
+| POST | `/v1/messages` | Key 或匿名 | Anthropic Messages API |
 | GET | `/v1/codex-catalog` | 否 | Codex 远程模型目录（非敏感，故意免认证） |
-| — | `/admin` | 会话 | WebUI |
+| — | `/admin` | 会话 | **管理台**（8 个页面） |
 | — | `/admin/api/*` | 会话 | 管理接口。常用：`state`（总览数据）、`settings`、`reprobe`、`probe/:id`、`logs`、`usage.csv`、`proxy-test`、`key/rotate`、`export`、`import` |
 | GET | `/admin/api/pool` | 会话 | 代理池状态（当前出口、可用节点、统计） |
 | POST | `/admin/api/pool/refresh` | 会话 | 重新抓取并测速（异步，约 1 分钟） |

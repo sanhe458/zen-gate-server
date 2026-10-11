@@ -426,6 +426,9 @@ pre{background:#0a0e14;border:1px solid var(--line);border-radius:10px;padding:1
         <option value="0.0.0.0">0.0.0.0 — 所有网卡（局域网/容器）</option>
       </select>
       <div class="hint">绑定 0.0.0.0 后 API 与管理页将暴露给局域网，务必设置 WebUI 密码</div>
+      <label>匿名调用限速</label><input type="number" id="fAnonRPM" min="0" max="100000" style="width:140px">
+      <div class="hint">不携带 API Key 的调用按来源 IP 限制每分钟次数（默认 60）；填 0 则关闭免 Key 调用。
+        对外展示页在 <code>/</code>，管理台在 <code>/admin</code></div>
       <label>WebUI 密码</label><input type="password" id="fPass" placeholder="留空 = 不修改" autocomplete="new-password">
       <div class="hint" id="passHint"></div>
     </div>
@@ -815,6 +818,7 @@ function fillSettings(){
   $("fPort").value=S.port;
   $("fHost").value=s.listenHost||"";
   $("fMainKey").value=S.mainKey;
+  $("fAnonRPM").value=(s.anonymousRpm===undefined?60:s.anonymousRpm);
   $("passHint").textContent=s.hasPassword?"已设置密码（修改后旧会话失效）":"未设置密码 — 仅本机 (127.0.0.1) 可访问管理页";
 }
 async function saveSettings(){
@@ -828,7 +832,8 @@ async function saveSettings(){
     proxyMode:$("fProxyMode").value,
     proxyUrl:$("fProxyUrl").value.trim(),
     port:+$("fPort").value||undefined,
-    listenHost:$("fHost").value
+    listenHost:$("fHost").value,
+    anonymousRpm:($("fAnonRPM").value===""?undefined:Math.max(0,+$("fAnonRPM").value))
   };
   if($("fPass").value.trim())body.webuiPassword=$("fPass").value.trim();
   try{
