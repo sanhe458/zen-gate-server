@@ -297,15 +297,15 @@ func main() {
 		}
 	}()
 
-	// daily quota reset. The free lane's quota refreshes at midnight, so the
-	// rotation blacklist — every egress IP rotated away from today — is
-	// dropped and the lane returns to the direct connection, whose quota is
-	// fresh again. From there the original rotation logic resumes once the
-	// direct line burns out.
+	// daily quota reset. The upstream free lane's quota refreshes at 00:00
+	// UTC — not local midnight — so the rotation blacklist (every egress IP
+	// rotated away from today) is dropped then and the lane returns to the
+	// direct connection, whose quota is fresh again. From there the original
+	// rotation logic resumes once the direct line burns out.
 	go func() {
 		for {
-			now := time.Now()
-			next := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local).Add(24 * time.Hour)
+			now := time.Now().UTC()
+			next := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC).Add(24 * time.Hour)
 			t := time.NewTimer(time.Until(next))
 			select {
 			case <-ctx.Done():

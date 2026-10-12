@@ -302,7 +302,7 @@ pre{background:#0a0e14;border:1px solid var(--line);border-radius:10px;padding:1
       启用后：<b>先走本机直连</b> → 当某次请求出现额度不足，或每 <span id="poolProbeInt">15</span> 分钟探测中出现整轮限额时，
       自动从池中挑选<b>延迟最低且已验证可用</b>的代理接替，并重置限额状态重新探测。<br>
       每轮换走一个出口 IP，该 IP 当天即加入<b>轮换黑名单</b>，后续轮换不会再选到它（同一 IP 的其他端口也一样，额度是按 IP 算的）。<br>
-      免费额度每日 <b>0 点</b>刷新：届时自动<b>清空黑名单并切回本机直连</b>，额度用尽后继续按原策略轮换。<br>
+      免费额度每日 <b>UTC 0 点</b>刷新（北京时间早 8 点）：届时自动<b>清空黑名单并切回本机直连</b>，额度用尽后继续按原策略轮换。<br>
       池中代理全部来自公开免费列表，实测可用率约 1%～5%；连不通的、延迟过高的、IP 额度已耗尽的都不会被使用。
     </div>
   </div>
@@ -370,7 +370,7 @@ pre{background:#0a0e14;border:1px solid var(--line);border-radius:10px;padding:1
     </div>
     <div class="mut" style="margin-top:6px;line-height:1.8">
       额度不足轮换走一个出口 IP 后，该 IP 当天不再参与轮换（含同 IP 的其他端口）。
-      免费额度每天 <b>0 点</b>刷新，届时黑名单自动清空、并切回本机直连继续使用。
+      免费额度每天 <b>UTC 0 点</b>刷新（北京时间早 8 点），届时黑名单自动清空、并切回本机直连继续使用。
     </div>
     <div style="max-height:220px;overflow-y:auto;margin-top:10px">
       <table>
@@ -969,7 +969,7 @@ function renderPoolTable(){
 function renderBlacklist(){
   const bl=(POOL&&POOL.blacklist)||[];
   const meta=$("poolBlMeta"), body=$("poolBlBody");
-  if(meta)meta.textContent=bl.length?("今日 "+bl.length+" 个 IP · 每天 0 点自动清空"):"";
+  if(meta)meta.textContent=bl.length?("今日 "+bl.length+" 个 IP · 每天 UTC 0 点自动清空"):"";
   if(!body)return;
   if(!bl.length){
     body.innerHTML='<tr><td colspan="3" class="mut">今日还没有轮换过出口 IP</td></tr>';

@@ -276,10 +276,11 @@ func (p *ProxyPool) MarkExhausted(url string) {
 
 // --- rotation blacklist ------------------------------------------------------
 
-// todayDay is the local calendar day the blacklist belongs to. The free lane's
-// quota refreshes at midnight, so the day tag is what expires an entry.
+// todayDay is the calendar day the blacklist belongs to. The upstream free
+// quota refreshes at 00:00 UTC — not local midnight — so the day tag must be
+// computed in UTC for an entry to expire exactly when the quota does.
 func todayDay() string {
-	return time.Now().Format("2006-01-02")
+	return time.Now().UTC().Format("2006-01-02")
 }
 
 // rollDayLocked drops a blacklist that belongs to a previous day. Called on
@@ -447,7 +448,7 @@ func (p *ProxyPool) Rotate(ctx context.Context, markPrev bool) (string, error) {
 	}
 	if best == nil {
 		if blCount > 0 {
-			return "", fmt.Errorf("今日可用节点已全部轮换过（黑名单 %d 个 IP），0 点额度刷新后自动恢复", blCount)
+			return "", fmt.Errorf("今日可用节点已全部轮换过（黑名单 %d 个 IP），UTC 0 点额度刷新后自动恢复", blCount)
 		}
 		return "", fmt.Errorf("代理池中没有可用节点")
 	}
