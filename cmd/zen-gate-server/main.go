@@ -297,6 +297,35 @@ func main() {
 		}
 	}()
 
+	// daily quota reset. The free lane's quota refreshes at midnight, so the
+	// rotation blacklist — every egress IP rotated away from today — is
+	// dropped and the lane returns to the direct connection, whose quota is
+	// fresh again. From there the original rotation logic resumes once the
+	// direct line burns out.
+	go func() {
+		for {
+			now := time.Now()
+			next := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local).Add(24 * time.Hour)
+			t := time.NewTimer(time.Until(next))
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return
+			case <-t.C:
+			}
+			c := st.Config()
+			if !c.ProxyPoolEnabled || !c.ProxyPoolAutoRotate {
+				continue // nothing rotates automatically, so nothing to reset
+			}
+			n := pool.ResetDaily()
+			_ = pool.Use("") // the local line's quota just refreshed
+			logger.Infof("免费额度每日刷新：清空轮换黑名单（%d 个 IP），切回本机直连", n)
+			lastRotate.Store(0) // the new egress owes nothing, cooldown included
+			ln.ClearThrottle()
+			ln.ProbeRound(ctx, true)
+		}
+	}()
+
 	// graceful shutdown on SIGINT/SIGTERM (systemd sends SIGTERM)
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)

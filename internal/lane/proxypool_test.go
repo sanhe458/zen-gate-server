@@ -2,11 +2,13 @@ package lane
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	neturl "net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -157,6 +159,7 @@ func TestNormalizeProxy(t *testing.T) {
 // reachable proxy that has not been burned yet.
 func TestProxyPoolRotationOrder(t *testing.T) {
 	p := NewProxyPool(nil)
+	p.localIPLookup = func(context.Context) string { return "203.0.113.7" } // hermetic: no echo service
 	p.mu.Lock()
 	for _, e := range []*ProxyEntry{
 		{URL: "http://slow:1", OK: true, LatencyMs: 900},
@@ -568,5 +571,273 @@ func TestMarkCurrentDead(t *testing.T) {
 	}
 	if entries[0].Detail != "运行中失效（无法转发）" {
 		t.Errorf("detail = %q", entries[0].Detail)
+	}
+}
+
+// deadSource configures the pool with one unreachable listing so a dry-pool
+// rotation fails fast instead of hitting the public internet.
+func deadSource(p *ProxyPool) {
+	p.Configure([]string{"http://127.0.0.1:1/unused"}, 1, 1, 1, false)
+}
+
+// stubLocalIP makes the direct-line egress lookup hermetic.
+func stubLocalIP(p *ProxyPool, ip string) {
+	p.localIPLookup = func(context.Context) string { return ip }
+}
+
+// TestRotateBlacklistsEgressIP covers the day-scoped rotation blacklist: every
+// IP the lane rotates away from is retired, and no later rotation today can
+// land on it again — not even through a second port behind the same address,
+// because the free lane's quota is per IP.
+func TestRotateBlacklistsEgressIP(t *testing.T) {
+	p := NewProxyPool(nil)
+	stubLocalIP(p, "203.0.113.7")
+	p.mu.Lock()
+	for _, e := range []*ProxyEntry{
+		{URL: "http://a:1", OK: true, LatencyMs: 10, EgressIP: "10.0.0.1"},
+		{URL: "http://a:2", OK: true, LatencyMs: 5, EgressIP: "10.0.0.1"}, // same exit, fastest
+		{URL: "http://b:1", OK: true, LatencyMs: 20, EgressIP: "10.0.0.2"},
+		{URL: "http://c:1", OK: true, LatencyMs: 30, EgressIP: "10.0.0.3"},
+	} {
+		p.entries = append(p.entries, e)
+		p.byURL[e.URL] = e
+	}
+	p.mu.Unlock()
+
+	ctx := context.Background()
+
+	// rotation 1: direct → fastest node; the local line is retired too
+	first, err := p.Rotate(ctx, true)
+	if err != nil {
+		t.Fatalf("rotate 1: %v", err)
+	}
+	if first != "http://a:2" {
+		t.Errorf("rotate 1 = %s, want the fastest node", first)
+	}
+	if bl := p.Blacklist(); len(bl) != 1 || bl[0].IP != "203.0.113.7" {
+		t.Errorf("blacklist after rotate 1 = %+v, want the local egress IP", bl)
+	}
+
+	// rotation 2: a:1 is on the same exit and still faster than b:1, but the
+	// exit was retired by rotation 1 — it must be skipped, not used as a
+	// last-resort hop
+	second, err := p.Rotate(ctx, true)
+	if err != nil {
+		t.Fatalf("rotate 2: %v", err)
+	}
+	if second != "http://b:1" {
+		t.Errorf("rotate 2 = %s, want the next node on a different exit", second)
+	}
+
+	// rotation 3: last standing node
+	third, err := p.Rotate(ctx, true)
+	if err != nil {
+		t.Fatalf("rotate 3: %v", err)
+	}
+	if third != "http://c:1" {
+		t.Errorf("rotate 3 = %s, want the last node", third)
+	}
+
+	// every rotated-away exit is on the blacklist now (the current one joins
+	// on the next rotation, not before)
+	want := map[string]bool{"203.0.113.7": true, "10.0.0.1": true, "10.0.0.2": true}
+	for _, b := range p.Blacklist() {
+		delete(want, b.IP)
+	}
+	if len(want) != 0 {
+		t.Errorf("blacklist missing %v", want)
+	}
+	if n := p.UsableCount(); n != 1 {
+		t.Errorf("UsableCount = %d, want 1 (only the current node left)", n)
+	}
+
+	// rotation 4: nothing left — the error must say why, not just "empty"
+	deadSource(p)
+	if _, err := p.Rotate(ctx, true); err == nil {
+		t.Fatal("expected an error once every node is retired")
+	} else if !strings.Contains(err.Error(), "黑名单") {
+		t.Errorf("dry error = %q, want it to mention the blacklist", err)
+	}
+}
+
+// TestRotateSameExitFallback: a manual switch may still hop to a second port
+// on the current exit (the user asked for a different node, not a quota
+// reset), but a quota rotation must never fall back to the same exit.
+func TestRotateSameExitFallbackOnlyForManualSwitch(t *testing.T) {
+	p := NewProxyPool(nil)
+	stubLocalIP(p, "203.0.113.7")
+	p.mu.Lock()
+	for _, e := range []*ProxyEntry{
+		{URL: "http://a:1", OK: true, LatencyMs: 10, EgressIP: "10.0.0.1"},
+		{URL: "http://a:2", OK: true, LatencyMs: 5, EgressIP: "10.0.0.1"},
+	} {
+		p.entries = append(p.entries, e)
+		p.byURL[e.URL] = e
+	}
+	p.current = "http://a:1"
+	p.mu.Unlock()
+
+	ctx := context.Background()
+
+	// manual switch: same-exit node is the last resort, and allowed
+	got, err := p.Rotate(ctx, false)
+	if err != nil {
+		t.Fatalf("manual rotate: %v", err)
+	}
+	if got != "http://a:2" {
+		t.Errorf("manual rotate = %s, want the same-exit fallback", got)
+	}
+	if n := len(p.Blacklist()); n != 0 {
+		t.Errorf("manual rotate blacklisted %d IPs, want 0", n)
+	}
+
+	// quota rotation from the same spot: the exit is retired, so there is
+	// nowhere to go — no same-exit hop, no matter how fast the node is
+	p.mu.Lock()
+	p.current = "http://a:1"
+	p.mu.Unlock()
+	deadSource(p)
+	if _, err := p.Rotate(ctx, true); err == nil {
+		t.Error("quota rotation fell back to the same exit")
+	}
+	if bl := p.Blacklist(); len(bl) != 1 || bl[0].IP != "10.0.0.1" {
+		t.Errorf("blacklist = %+v, want the retired exit IP", bl)
+	}
+}
+
+// TestBlacklistDayRollover: the blacklist is day-scoped. A map left over from
+// yesterday expires the moment it is read, and ResetDaily drops it explicitly.
+func TestBlacklistDayRollover(t *testing.T) {
+	p := NewProxyPool(nil)
+	p.mu.Lock()
+	p.blacklistDay = "1999-12-31" // yesterday
+	p.blacklist["10.0.0.1"] = BlacklistEntry{IP: "10.0.0.1", Reason: "额度耗尽", At: 1}
+	p.blacklist["10.0.0.2"] = BlacklistEntry{IP: "10.0.0.2", Reason: "额度耗尽", At: 2}
+	e := &ProxyEntry{URL: "http://a:1", OK: true, EgressIP: "10.0.0.1"}
+	p.entries = append(p.entries, e)
+	p.byURL[e.URL] = e
+	p.mu.Unlock()
+
+	// a stale blacklist must not hide today's candidates
+	if n := p.UsableCount(); n != 1 {
+		t.Errorf("UsableCount = %d, want 1 (yesterday's blacklist is stale)", n)
+	}
+	if n := len(p.Blacklist()); n != 0 {
+		t.Errorf("Blacklist = %d entries after rollover, want 0", n)
+	}
+
+	// the explicit midnight reset path reports what it dropped
+	p.mu.Lock()
+	p.blacklist["10.0.0.9"] = BlacklistEntry{IP: "10.0.0.9", At: 3}
+	p.mu.Unlock()
+	if n := p.ResetDaily(); n != 1 {
+		t.Errorf("ResetDaily dropped %d, want 1", n)
+	}
+	if n := len(p.Blacklist()); n != 0 {
+		t.Errorf("Blacklist = %d after ResetDaily, want 0", n)
+	}
+}
+
+// TestBlacklistPersistsAcrossRestart: the blacklist rides along in
+// proxypool.json so a restart does not forget which exits are retired — but a
+// snapshot from an earlier day is stale and dropped on load.
+func TestBlacklistPersistsAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "proxypool.json")
+
+	p1 := NewProxyPool(nil)
+	p1.SetStorage(path)
+	p1.mu.Lock()
+	for _, e := range []*ProxyEntry{
+		{URL: "http://a:1", OK: true, LatencyMs: 10, EgressIP: "10.0.0.1"},
+		{URL: "http://b:1", OK: true, LatencyMs: 20, EgressIP: "10.0.0.2"},
+	} {
+		p1.entries = append(p1.entries, e)
+		p1.byURL[e.URL] = e
+	}
+	p1.current = "http://a:1"
+	p1.mu.Unlock()
+	deadSource(p1) // a dry pool must refill from nowhere, not the internet
+	got, err := p1.Rotate(context.Background(), true)
+	if err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	if got != "http://b:1" {
+		t.Fatalf("rotate = %s, want http://b:1", got)
+	}
+	p1.save()
+
+	p2 := NewProxyPool(nil)
+	p2.SetStorage(path)
+	if err := p2.Load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	bl := p2.Blacklist()
+	if len(bl) != 1 || bl[0].IP != "10.0.0.1" {
+		t.Fatalf("restored blacklist = %+v, want the retired exit IP", bl)
+	}
+	if n := p2.UsableCount(); n != 1 {
+		t.Errorf("UsableCount = %d after restore, want 1 (b:1 still live, a:1 retired)", n)
+	}
+
+	// rewrite the snapshot as if it were written yesterday
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pf poolFile
+	if err := json.Unmarshal(data, &pf); err != nil {
+		t.Fatal(err)
+	}
+	pf.BlacklistDay = "1999-12-31"
+	out, _ := json.Marshal(pf)
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p3 := NewProxyPool(nil)
+	p3.SetStorage(path)
+	if err := p3.Load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if n := len(p3.Blacklist()); n != 0 {
+		t.Errorf("stale blacklist survived load (%d entries)", n)
+	}
+	// b:1 is still live; a:1 stays exhausted (that flag is per-URL and only a
+	// refresh re-tests it) but is no longer blacklist-hidden
+	if n := p3.UsableCount(); n != 1 {
+		t.Errorf("UsableCount = %d after stale load, want 1 (b:1 live, a:1 exhausted)", n)
+	}
+}
+
+// TestSnapshotFlagsBlacklistedEntries: the dashboard needs to tell "retired
+// for today" apart from "quota burned", so the overlay must be per-entry.
+func TestSnapshotFlagsBlacklistedEntries(t *testing.T) {
+	p := NewProxyPool(nil)
+	p.mu.Lock()
+	for _, e := range []*ProxyEntry{
+		{URL: "http://a:1", OK: true, LatencyMs: 10, EgressIP: "10.0.0.1"},
+		{URL: "http://a:2", OK: true, LatencyMs: 20, EgressIP: "10.0.0.1"},
+		{URL: "http://b:1", OK: true, LatencyMs: 30, EgressIP: "10.0.0.2"},
+	} {
+		p.entries = append(p.entries, e)
+		p.byURL[e.URL] = e
+	}
+	p.blacklist["10.0.0.1"] = BlacklistEntry{IP: "10.0.0.1", Reason: "额度耗尽", At: 1}
+	p.mu.Unlock()
+
+	_, entries, _, _, _, _ := p.Snapshot()
+	byURL := map[string]ProxyEntry{}
+	for _, e := range entries {
+		byURL[e.URL] = e
+	}
+	if !byURL["http://a:1"].Blacklisted || !byURL["http://a:2"].Blacklisted {
+		t.Error("entries on a blacklisted exit are not flagged")
+	}
+	if byURL["http://b:1"].Blacklisted {
+		t.Error("entry on a live exit flagged as blacklisted")
+	}
+	// usable first: the flagged nodes sort behind the live one
+	if entries[0].URL != "http://b:1" {
+		t.Errorf("first entry = %s, want the non-blacklisted one", entries[0].URL)
 	}
 }

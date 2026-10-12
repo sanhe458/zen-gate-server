@@ -847,11 +847,12 @@ func (s *Server) adminPoolState(w http.ResponseWriter) {
 	}
 	cur, entries, refreshing, stats, lastAt, lastErr := s.pool.Snapshot()
 	sources, maxTest, conc, timeoutSec, verify := s.pool.Config()
+	blacklist := s.pool.Blacklist()
 	cfg := s.Store.Config()
 
 	usable := 0
 	for _, e := range entries {
-		if e.OK && !e.Exhausted {
+		if e.OK && !e.Exhausted && !e.Blacklisted {
 			usable++
 		}
 	}
@@ -872,6 +873,7 @@ func (s *Server) adminPoolState(w http.ResponseWriter) {
 		"total":          len(entries),
 		"shown":          len(capped),
 		"entries":        capped,
+		"blacklist":      blacklist,
 		"lastAt":         lastAt,
 		"lastError":      lastErr,
 		"stats":          stats,
@@ -960,17 +962,18 @@ func (s *Server) poolSummary() map[string]any {
 	cur, _, refreshing, stats, _, lastErr := s.pool.Snapshot()
 	cfg := s.Store.Config()
 	return map[string]any{
-		"available":  true,
-		"enabled":    cfg.ProxyPoolEnabled,
-		"autoRotate": cfg.ProxyPoolAutoRotate,
-		"current":    cur,
-		"usable":     s.pool.UsableCount(),
-		"refreshing": refreshing,
-		"rotations":  stats.Rotations,
-		"fetched":    stats.Fetched,
-		"tested":     stats.Tested,
-		"passed":     stats.Passed,
-		"exhausted":  stats.Exhausted,
-		"lastError":  lastErr,
+		"available":   true,
+		"enabled":     cfg.ProxyPoolEnabled,
+		"autoRotate":  cfg.ProxyPoolAutoRotate,
+		"current":     cur,
+		"usable":      s.pool.UsableCount(),
+		"blacklisted": len(s.pool.Blacklist()),
+		"refreshing":  refreshing,
+		"rotations":   stats.Rotations,
+		"fetched":     stats.Fetched,
+		"tested":      stats.Tested,
+		"passed":      stats.Passed,
+		"exhausted":   stats.Exhausted,
+		"lastError":   lastErr,
 	}
 }

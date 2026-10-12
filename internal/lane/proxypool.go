@@ -62,6 +62,10 @@ type ProxyEntry struct {
 	// Such a proxy is reachable but useless for this lane.
 	Exhausted bool   `json:"exhausted"`
 	Country   string `json:"country,omitempty"`
+	// Blacklisted is a display-only overlay: this egress's IP was rotated away
+	// from earlier today and is retired until the midnight reset. It is
+	// derived from the pool's blacklist on read and never persisted.
+	Blacklisted bool `json:"blacklisted,omitempty"`
 	// EgressIP is the public address this proxy actually exits from, measured
 	// through it. Two listings behind one IP share one daily quota, so this
 	// keeps rotation from wasting a hop on a "different" proxy that is not.
@@ -69,6 +73,16 @@ type ProxyEntry struct {
 	Detail   string `json:"detail,omitempty"`
 	LastTest int64  `json:"lastTest"`
 	Failures int    `json:"failures,omitempty"`
+}
+
+// BlacklistEntry records one egress IP retired for the rest of the day. The
+// free lane's quota is accounted per IP and refreshes at midnight, so the
+// entry carries the day it belongs to: a blacklist read back from disk on a
+// later day is stale and dropped.
+type BlacklistEntry struct {
+	IP     string `json:"ip"`
+	Reason string `json:"reason"`
+	At     int64  `json:"at"` // epoch ms when it was retired
 }
 
 // ProxyPool keeps a tested, latency-sorted set of free proxies and remembers
@@ -85,6 +99,16 @@ type ProxyPool struct {
 	// storagePath persists the tested set so a restart does not throw away a
 	// minute of probing (empty = in-memory only).
 	storagePath string
+
+	// blacklist holds egress IPs rotated away from today. Rotation never
+	// picks them again — a second port behind the same address shares the
+	// same daily quota — until the midnight reset clears the map.
+	blacklist    map[string]BlacklistEntry
+	blacklistDay string // local "2006-01-02" the blacklist belongs to
+
+	// localIPLookup resolves this machine's own public egress address, used to
+	// blacklist the direct line when its quota burns out. Overridable in tests.
+	localIPLookup func(ctx context.Context) string
 
 	// configuration (guarded by mu)
 	sources        []string
@@ -122,6 +146,8 @@ func NewProxyPool(log func(string, ...any)) *ProxyPool {
 		concurrency:    120,
 		timeout:        6 * time.Second,
 		verifyUpstream: true,
+		blacklist:      map[string]BlacklistEntry{},
+		blacklistDay:   todayDay(),
 		log:            log,
 	}
 }
@@ -166,11 +192,18 @@ func (p *ProxyPool) Config() (sources []string, maxTest, concurrency, timeoutSec
 
 // Snapshot is the dashboard view: the current egress plus every tested entry.
 func (p *ProxyPool) Snapshot() (current string, entries []ProxyEntry, refreshing bool, stats poolStats, lastAt int64, lastErr string) {
+	p.rollDay()
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	out := make([]ProxyEntry, 0, len(p.entries))
 	for _, e := range p.entries {
-		out = append(out, *e)
+		cp := *e
+		if cp.EgressIP != "" {
+			if _, bl := p.blacklist[cp.EgressIP]; bl {
+				cp.Blacklisted = true // derived overlay, recomputed on every read
+			}
+		}
+		out = append(out, cp)
 	}
 	// usable first, shortest latency first
 	sort.SliceStable(out, func(i, j int) bool {
@@ -179,6 +212,9 @@ func (p *ProxyPool) Snapshot() (current string, entries []ProxyEntry, refreshing
 		}
 		if out[i].Exhausted != out[j].Exhausted {
 			return !out[i].Exhausted
+		}
+		if out[i].Blacklisted != out[j].Blacklisted {
+			return !out[i].Blacklisted
 		}
 		return out[i].LatencyMs < out[j].LatencyMs
 	})
@@ -238,13 +274,106 @@ func (p *ProxyPool) MarkExhausted(url string) {
 	p.mu.Unlock()
 }
 
-// Usable lists reachable, non-exhausted proxies sorted by latency.
+// --- rotation blacklist ------------------------------------------------------
+
+// todayDay is the local calendar day the blacklist belongs to. The free lane's
+// quota refreshes at midnight, so the day tag is what expires an entry.
+func todayDay() string {
+	return time.Now().Format("2006-01-02")
+}
+
+// rollDayLocked drops a blacklist that belongs to a previous day. Called on
+// every read path so a process that was not running at midnight (or was
+// suspended across it) still starts the new day with a clean slate.
+func (p *ProxyPool) rollDayLocked() {
+	day := todayDay()
+	if p.blacklistDay == day {
+		return
+	}
+	p.blacklistDay = day
+	p.blacklist = map[string]BlacklistEntry{}
+}
+
+// rollDay is the lock-taking form for read paths.
+func (p *ProxyPool) rollDay() {
+	p.mu.Lock()
+	p.rollDayLocked()
+	p.mu.Unlock()
+}
+
+// blacklistAddLocked retires an egress IP for the rest of the day.
+func (p *ProxyPool) blacklistAddLocked(ip, reason string) {
+	if ip == "" {
+		return
+	}
+	if p.blacklist == nil {
+		p.blacklist = map[string]BlacklistEntry{}
+	}
+	p.blacklist[ip] = BlacklistEntry{IP: ip, Reason: reason, At: time.Now().UnixMilli()}
+}
+
+// blacklistedLocked reports whether an egress IP is retired for today. An
+// unknown ("") egress IP can never be matched, so it is never blacklisted.
+func (p *ProxyPool) blacklistedLocked(ip string) bool {
+	if ip == "" || len(p.blacklist) == 0 {
+		return false
+	}
+	_, ok := p.blacklist[ip]
+	return ok
+}
+
+// Blacklist lists the egress IPs retired for the rest of the day, newest
+// first. Rotation skips every one of them until the midnight reset.
+func (p *ProxyPool) Blacklist() []BlacklistEntry {
+	p.rollDay()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make([]BlacklistEntry, 0, len(p.blacklist))
+	for _, b := range p.blacklist {
+		out = append(out, b)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].At > out[j].At })
+	return out
+}
+
+// ResetDaily clears the day's blacklist. The caller (the midnight job) then
+// returns the lane to the direct connection, whose quota just refreshed.
+// Returns how many IPs were dropped.
+func (p *ProxyPool) ResetDaily() int {
+	p.mu.Lock()
+	n := len(p.blacklist)
+	p.blacklist = map[string]BlacklistEntry{}
+	p.blacklistDay = todayDay()
+	p.mu.Unlock()
+	if n > 0 {
+		p.save() // persist the cleared state so a restart cannot resurrect it
+	}
+	return n
+}
+
+// localEgressIP resolves this machine's public address on a direct connection,
+// so the local line itself can be blacklisted when its quota burns out.
+// Non-fatal by design: the direct IP is never a pool candidate anyway, so a
+// failed lookup only costs the bookkeeping.
+func (p *ProxyPool) localEgressIP(ctx context.Context) string {
+	if p.localIPLookup != nil {
+		return p.localIPLookup(ctx)
+	}
+	client := &http.Client{Timeout: 6 * time.Second}
+	defer client.CloseIdleConnections()
+	return p.lookupEgressIP(ctx, client)
+}
+
+// Usable lists reachable, non-exhausted proxies sorted by latency. Egress IPs
+// on today's blacklist are excluded: they are reachable but retired, and
+// rotating onto one would only buy another quota refusal.
 func (p *ProxyPool) Usable() []*ProxyEntry {
+	p.rollDay()
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	out := []*ProxyEntry{}
 	for _, e := range p.entries {
-		if e.OK && !e.Exhausted {
+		if e.OK && !e.Exhausted && !p.blacklistedLocked(e.EgressIP) {
 			out = append(out, e)
 		}
 	}
@@ -254,11 +383,12 @@ func (p *ProxyPool) Usable() []*ProxyEntry {
 
 // UsableCount reports how many rotation candidates are ready.
 func (p *ProxyPool) UsableCount() int {
+	p.rollDay()
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	n := 0
 	for _, e := range p.entries {
-		if e.OK && !e.Exhausted {
+		if e.OK && !e.Exhausted && !p.blacklistedLocked(e.EgressIP) {
 			n++
 		}
 	}
@@ -268,10 +398,15 @@ func (p *ProxyPool) UsableCount() int {
 // Rotate moves to the lowest-latency usable proxy that is not the current one.
 // markPrev records the outgoing egress as quota-burned — correct when rotation
 // was triggered by a 429, wrong when the user just wants a different exit (a
-// manual switch must not silently retire nodes). It refreshes the pool when it
-// runs dry. Returns the new proxy URL ("" = nothing available).
+// manual switch must not silently retire nodes). On a quota rotation the
+// outgoing exit IP also joins the day's blacklist, so no later rotation today
+// can land on it again — not even on a second port behind the same address,
+// since the free lane's quota is per IP and only refreshes at midnight. It
+// refreshes the pool when it runs dry. Returns the new proxy URL ("" = nothing
+// available).
 func (p *ProxyPool) Rotate(ctx context.Context, markPrev bool) (string, error) {
 	p.mu.Lock()
+	p.rollDayLocked()
 	prev := p.current
 	curIP := ""
 	if prev != "" {
@@ -283,13 +418,68 @@ func (p *ProxyPool) Rotate(ctx context.Context, markPrev bool) (string, error) {
 			}
 		}
 	}
-	// Prefer a node on a genuinely different exit. Quota is per IP, so a
-	// second port behind the same address only buys another 429 — the pool
-	// falls back to one when nothing else is left.
-	var best, sameExit *ProxyEntry
+	// A dead proxy is not a quota problem: its IP may host other live ports and
+	// a later refresh re-tests them, so only a quota rotation retires the exit.
+	retireDirect := markPrev && prev == "" // the local line itself just burned out
+	if markPrev && curIP != "" {
+		p.blacklistAddLocked(curIP, "额度耗尽")
+	}
+	best, sameExit := p.pickLocked(prev, curIP)
+	if best == nil {
+		best = sameExit
+	}
+	blCount := len(p.blacklist)
+	p.mu.Unlock()
+
+	if best == nil {
+		// pool dry — refill in place, then pick again
+		p.log("代理池已无可用节点，正在补充…")
+		if _, _, err := p.Refresh(ctx); err != nil {
+			p.lastErrSet(err)
+		}
+		p.mu.Lock()
+		best, sameExit = p.pickLocked(prev, curIP)
+		if best == nil {
+			best = sameExit
+		}
+		blCount = len(p.blacklist)
+		p.mu.Unlock()
+	}
+	if best == nil {
+		if blCount > 0 {
+			return "", fmt.Errorf("今日可用节点已全部轮换过（黑名单 %d 个 IP），0 点额度刷新后自动恢复", blCount)
+		}
+		return "", fmt.Errorf("代理池中没有可用节点")
+	}
+	// Commit the switch before the (possibly slow) local-IP lookup so the
+	// handover itself never waits on the echo service.
+	p.mu.Lock()
+	p.current = best.URL
+	p.poolStats.Rotations++
+	p.mu.Unlock()
+	p.apply()
+	if retireDirect {
+		if ip := p.localEgressIP(ctx); ip != "" {
+			p.mu.Lock()
+			p.blacklistAddLocked(ip, "额度耗尽")
+			p.mu.Unlock()
+		}
+	}
+	return best.URL, nil
+}
+
+// pickLocked chooses the rotation target: the lowest-latency usable entry that
+// is neither the current URL nor on an exit retired for today. A second port
+// on the current egress (sameExit) is only a last resort — and never when that
+// egress is blacklisted, because quota is per IP and a same-exit hop would
+// just burn another refusal.
+func (p *ProxyPool) pickLocked(prevURL, curIP string) (best, sameExit *ProxyEntry) {
 	for _, e := range p.entries {
-		if !e.OK || e.Exhausted || e.URL == prev {
+		if !e.OK || e.Exhausted || e.URL == prevURL {
 			continue
+		}
+		if p.blacklistedLocked(e.EgressIP) {
+			continue // retired for the rest of the day
 		}
 		if curIP != "" && e.EgressIP == curIP {
 			if sameExit == nil || e.LatencyMs < sameExit.LatencyMs {
@@ -301,46 +491,7 @@ func (p *ProxyPool) Rotate(ctx context.Context, markPrev bool) (string, error) {
 			best = e
 		}
 	}
-	if best == nil {
-		best = sameExit
-	}
-	p.mu.Unlock()
-
-	if best == nil {
-		// pool dry — refill in place, then pick again
-		p.log("代理池已无可用节点，正在补充…")
-		if _, _, err := p.Refresh(ctx); err != nil {
-			p.lastErrSet(err)
-		}
-		p.mu.Lock()
-		for _, e := range p.entries {
-			if !e.OK || e.Exhausted || e.URL == prev {
-				continue
-			}
-			if curIP != "" && e.EgressIP == curIP {
-				if sameExit == nil || e.LatencyMs < sameExit.LatencyMs {
-					sameExit = e
-				}
-				continue
-			}
-			if best == nil || e.LatencyMs < best.LatencyMs {
-				best = e
-			}
-		}
-		if best == nil {
-			best = sameExit
-		}
-		p.mu.Unlock()
-	}
-	if best == nil {
-		return "", fmt.Errorf("代理池中没有可用节点")
-	}
-	p.mu.Lock()
-	p.current = best.URL
-	p.poolStats.Rotations++
-	p.mu.Unlock()
-	p.apply()
-	return best.URL, nil
+	return best, sameExit
 }
 
 func (p *ProxyPool) lastErrSet(err error) {
@@ -352,6 +503,7 @@ func (p *ProxyPool) lastErrSet(err error) {
 // Refresh fetches the sources and re-tests candidates. Safe to call
 // concurrently: a second call while one is running returns immediately.
 func (p *ProxyPool) Refresh(ctx context.Context) (tested, passed int, err error) {
+	p.rollDay()
 	p.mu.Lock()
 	if p.refreshing {
 		p.mu.Unlock()
@@ -391,7 +543,9 @@ func (p *ProxyPool) Refresh(ctx context.Context) (tested, passed int, err error)
 	carried := 0
 	p.mu.RLock()
 	for _, e := range p.byURL {
-		if e.OK && !e.Exhausted {
+		// a blacklisted exit is retired for the day: re-testing it only wastes
+		// a probe slot on an IP that cannot serve until midnight anyway
+		if e.OK && !e.Exhausted && !p.blacklistedLocked(e.EgressIP) {
 			candidates = append([]proxyCandidate{{Raw: e.URL, Scheme: e.Scheme, Country: e.Country}}, candidates...)
 			carried++
 		}
@@ -1005,14 +1159,18 @@ func (p *ProxyPool) SetStorage(path string) {
 }
 
 type poolFile struct {
-	SavedAt int64         `json:"savedAt"`
-	Stats   poolStats     `json:"stats"`
-	Entries []*ProxyEntry `json:"entries"`
+	SavedAt      int64            `json:"savedAt"`
+	BlacklistDay string           `json:"blacklistDay,omitempty"`
+	Blacklist    []BlacklistEntry `json:"blacklist,omitempty"`
+	Stats        poolStats        `json:"stats"`
+	Entries      []*ProxyEntry    `json:"entries"`
 }
 
 // Load restores the last saved set. Entries are kept as-is; the next Refresh
 // re-verifies every survivor (they are carried to the front of the candidate
-// list), so a stale node never survives long.
+// list), so a stale node never survives long. The blacklist is day-scoped: a
+// snapshot written on an earlier day carries a blacklist that expired at
+// midnight, so it is dropped unless it belongs to today.
 func (p *ProxyPool) Load() error {
 	p.mu.RLock()
 	path := p.storagePath
@@ -1036,16 +1194,27 @@ func (p *ProxyPool) Load() error {
 		if e == nil || e.URL == "" {
 			continue
 		}
+		e.Blacklisted = false // derived overlay: recomputed from the blacklist
 		p.entries = append(p.entries, e)
 		p.byURL[e.URL] = e
 	}
 	p.poolStats = pf.Stats
 	p.lastAt = pf.SavedAt
+	p.blacklist = map[string]BlacklistEntry{}
+	p.blacklistDay = todayDay()
+	if pf.BlacklistDay == p.blacklistDay {
+		for _, b := range pf.Blacklist {
+			if b.IP != "" {
+				p.blacklist[b.IP] = b
+			}
+		}
+	}
 	return nil
 }
 
 // save writes the tested set; only worthwhile entries are kept (reachable
-// ones, so exhausted/dead nodes do not accumulate in the file).
+// ones, so exhausted/dead nodes do not accumulate in the file). The day's
+// blacklist rides along so a restart does not forget which exits are retired.
 func (p *ProxyPool) save() {
 	p.mu.RLock()
 	path := p.storagePath
@@ -1055,7 +1224,12 @@ func (p *ProxyPool) save() {
 			keep = append(keep, e)
 		}
 	}
-	pf := poolFile{SavedAt: p.lastAt, Stats: p.poolStats, Entries: keep}
+	bl := make([]BlacklistEntry, 0, len(p.blacklist))
+	for _, b := range p.blacklist {
+		bl = append(bl, b)
+	}
+	sort.Slice(bl, func(i, j int) bool { return bl[i].IP < bl[j].IP })
+	pf := poolFile{SavedAt: p.lastAt, BlacklistDay: p.blacklistDay, Blacklist: bl, Stats: p.poolStats, Entries: keep}
 	p.mu.RUnlock()
 	if path == "" {
 		return
