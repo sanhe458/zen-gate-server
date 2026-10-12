@@ -213,6 +213,48 @@ func DetectEgress(ctx context.Context) Egress {
 // shrink it.
 var egressAttemptTimeout = 10 * time.Second
 
+// echoServices are the IP-echo endpoints tried in order. A var so tests can
+// point every attempt at a local fixture — with the real endpoints baked in,
+// a CI runner with internet would occasionally get a live answer and break
+// the hanging-server assertions.
+var echoServices = []struct {
+	url   string
+	parse func([]byte) Egress
+}{
+	{
+		url: "https://ipinfo.io/json",
+		parse: func(b []byte) Egress {
+			var m struct {
+				IP      string `json:"ip"`
+				Country string `json:"country"`
+			}
+			_ = json.Unmarshal(b, &m)
+			return Egress{IP: m.IP, Country: strings.ToUpper(m.Country)}
+		},
+	},
+	{
+		url: "https://api.ipify.org?format=json",
+		parse: func(b []byte) Egress {
+			var m struct {
+				IP string `json:"ip"`
+			}
+			_ = json.Unmarshal(b, &m)
+			return Egress{IP: m.IP}
+		},
+	},
+	{
+		url: "https://ipapi.co/json/",
+		parse: func(b []byte) Egress {
+			var m struct {
+				IP          string `json:"ip"`
+				CountryCode string `json:"country_code"`
+			}
+			_ = json.Unmarshal(b, &m)
+			return Egress{IP: m.IP, Country: strings.ToUpper(m.CountryCode)}
+		},
+	},
+}
+
 // DetectEgressVia is DetectEgress through an explicit client (proxy testing).
 func DetectEgressVia(ctx context.Context, client *http.Client) Egress {
 	try := func(url string, parse func([]byte) Egress) (Egress, bool) {
@@ -237,34 +279,10 @@ func DetectEgressVia(ctx context.Context, client *http.Client) Egress {
 		}
 		return e, true
 	}
-	if e, ok := try("https://ipinfo.io/json", func(b []byte) Egress {
-		var m struct {
-			IP      string `json:"ip"`
-			Country string `json:"country"`
+	for _, svc := range echoServices {
+		if e, ok := try(svc.url, svc.parse); ok {
+			return e
 		}
-		_ = json.Unmarshal(b, &m)
-		return Egress{IP: m.IP, Country: strings.ToUpper(m.Country)}
-	}); ok {
-		return e
-	}
-	if e, ok := try("https://api.ipify.org?format=json", func(b []byte) Egress {
-		var m struct {
-			IP string `json:"ip"`
-		}
-		_ = json.Unmarshal(b, &m)
-		return Egress{IP: m.IP}
-	}); ok {
-		return e
-	}
-	if e, ok := try("https://ipapi.co/json/", func(b []byte) Egress {
-		var m struct {
-			IP          string `json:"ip"`
-			CountryCode string `json:"country_code"`
-		}
-		_ = json.Unmarshal(b, &m)
-		return Egress{IP: m.IP, Country: strings.ToUpper(m.CountryCode)}
-	}); ok {
-		return e
 	}
 	return Egress{}
 }

@@ -265,6 +265,24 @@ func TestDetectEgressHangingServerTimesOut(t *testing.T) {
 	}))
 	defer hung.Close()
 
+	// The hanging fixture must own every attempt: with the real echo
+	// endpoints in the list, an internet-connected runner would occasionally
+	// get a live answer first and break the assertion below.
+	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"ip":"203.0.113.7"}`))
+	}))
+	defer live.Close()
+	oldSvc := echoServices
+	echoServices = []struct {
+		url   string
+		parse func([]byte) Egress
+	}{
+		{url: hung.URL, parse: func(b []byte) Egress { return Egress{IP: "203.0.113.7"} }},
+		{url: hung.URL, parse: func(b []byte) Egress { return Egress{IP: "203.0.113.7"} }},
+		{url: hung.URL, parse: func(b []byte) Egress { return Egress{IP: "203.0.113.7"} }},
+	}
+	defer func() { echoServices = oldSvc }()
+
 	client := &http.Client{} // no timeout of its own, like laneHTTP
 	done := make(chan Egress, 1)
 	go func() { done <- DetectEgressVia(context.Background(), client) }()
