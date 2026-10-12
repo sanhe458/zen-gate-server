@@ -240,3 +240,38 @@ func TestProxyTestAcceptsSchemelessAddress(t *testing.T) {
 		t.Fatalf("schemeless proxy address rejected: %s", w.Body.String())
 	}
 }
+
+// TestAdminImportAppliesProxyPool pins the import fix: importing a config
+// with the proxy pool enabled used to persist the numbers but leave the
+// running lane on the old egress mode and the pool on the old sources until
+// the next restart — the import reported success while nothing took effect.
+func TestAdminImportAppliesProxyPool(t *testing.T) {
+	s := newTestServer(t)
+	s.SetProxyPool(lane.NewProxyPool(nil))
+
+	body := `{"mainKey":"ofm-imported","port":9999,
+		"proxyPoolEnabled":true,
+		"proxyPoolSources":["http://example.com/list.txt"],
+		"proxyPoolMaxTest":42,"proxyPoolConcurrency":7,
+		"proxyPoolTimeoutSec":9,"proxyPoolVerifyUpstream":false}`
+	r := httptest.NewRequest(http.MethodPost, "/admin/api/import", strings.NewReader(body))
+	r.RemoteAddr = "127.0.0.1:5555"
+	r.Header.Set("Content-Type", "application/json")
+	w := do(t, s, r)
+	if w.Code != 200 {
+		t.Fatalf("import failed: %d %s", w.Code, w.Body.String())
+	}
+
+	cfg := s.Store.Config()
+	if !cfg.ProxyPoolEnabled || cfg.ProxyPoolMaxTest != 42 || cfg.ProxyPoolTimeoutSec != 9 {
+		t.Fatalf("imported config not persisted: %+v", cfg)
+	}
+	sources, maxTest, conc, timeoutSec, verify := s.pool.Config()
+	if len(sources) != 1 || sources[0] != "http://example.com/list.txt" {
+		t.Errorf("pool sources not reconfigured: %v", sources)
+	}
+	if maxTest != 42 || conc != 7 || timeoutSec != 9 || verify {
+		t.Errorf("pool parameters not reconfigured: maxTest=%d conc=%d timeout=%ds verify=%v",
+			maxTest, conc, timeoutSec, verify)
+	}
+}

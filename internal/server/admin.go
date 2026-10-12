@@ -763,7 +763,17 @@ func (s *Server) adminImport(w http.ResponseWriter, r *http.Request) {
 	s.Lane.SetDefaultMaxTokens(incoming.DefaultMaxTokens)
 	s.Lane.SetExposeRegion(incoming.ExposeRegion)
 	s.Lane.SetFailover(incoming.FailoverEnabled, incoming.FailoverMax)
-	if !incoming.ProxyPoolEnabled {
+	// Mirror the settings handler: an imported pool config must reach both
+	// the pool itself (sources, budgets) and the transport. Skipping the
+	// SetProxy("pool") swap left the lane on the old egress until restart.
+	if s.pool != nil {
+		s.pool.Configure(incoming.ProxyPoolSources, incoming.ProxyPoolMaxTest, incoming.ProxyPoolConcurrency,
+			incoming.ProxyPoolTimeoutSec, incoming.ProxyPoolVerifyUpstream)
+	}
+	if incoming.ProxyPoolEnabled {
+		lane.SetProxy("pool", "")
+	} else {
+		lane.SetActiveProxy(nil)
 		lane.SetProxy(incoming.ProxyMode, incoming.ProxyURL)
 	}
 	if s.logger != nil {

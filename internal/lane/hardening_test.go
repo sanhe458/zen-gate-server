@@ -185,3 +185,27 @@ func TestStreamReaderSendUnblocksOnClose(t *testing.T) {
 		t.Fatal("send() blocked after Close — the pump goroutine would leak")
 	}
 }
+
+// TestReadSSEFinalLineWithoutNewline pins the cut-stream fix: a stream the
+// upstream closed mid-frame (no trailing newline on the last line) used to
+// drop that final frame — exactly where a terminal usage or finish frame
+// lands on a truncated answer.
+func TestReadSSEFinalLineWithoutNewline(t *testing.T) {
+	// note the missing trailing "\n" after the last data frame
+	body := "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":1}}\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":4}}"
+	var got []string
+	u, err := readSSE(strings.NewReader(body), func(p []byte) error {
+		got = append(got, string(p))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("onData called %d times, want 2 (the final unterminated frame must not be dropped)", len(got))
+	}
+	if u == nil || u.Input != 5 || u.Output != 5 {
+		t.Fatalf("usage = %+v, want input 5 / output 5 (1+4 from the final frame)", u)
+	}
+}

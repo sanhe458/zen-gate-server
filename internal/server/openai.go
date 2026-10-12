@@ -453,7 +453,9 @@ func (e *chatEmitter) stream(c lane.Chunk) []struct{ delta map[string]any } {
 	case lane.ChunkTextDelta:
 		out = append(out, struct{ delta map[string]any }{map[string]any{"content": c.Delta}})
 	case lane.ChunkReasonDelta:
-		out = append(out, struct{ delta map[string]any }{map[string]any{"reasoning": c.Delta}})
+		// keep the streamed field name in sync with the buffered response,
+		// which reports reasoning_content — clients key on that spelling
+		out = append(out, struct{ delta map[string]any }{map[string]any{"reasoning_content": c.Delta}})
 	case lane.ChunkBlockStart:
 		if c.BlockType == "tool-call" {
 			if e.openTool == nil {

@@ -458,23 +458,28 @@ func (s *streamReader) readWithTimeout(p []byte, timeout time.Duration) (int, er
 // readSSE parses `data:` frames, dropping comments and [DONE]. Usage-bearing
 // frames are merged into the returned total (each field appears on at most a
 // couple of terminal frames, so summation matches the reference behaviour).
+// A final line without its terminating newline (a stream cut mid-frame) is
+// still processed: dropping it could lose the last usage or finish frame.
 func readSSE(r io.Reader, onData func([]byte) error) (*Usage, error) {
 	br := bufio.NewReaderSize(r, 64*1024)
 	var usage *Usage
 	for {
 		line, err := br.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				return usage, nil
-			}
+		if err != nil && err != io.EOF {
 			return usage, err
 		}
 		trimmed := strings.TrimRight(line, "\r\n")
 		if trimmed == "" || strings.HasPrefix(trimmed, ":") || !strings.HasPrefix(trimmed, "data:") {
+			if err == io.EOF {
+				return usage, nil
+			}
 			continue
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
 		if payload == "" {
+			if err == io.EOF {
+				return usage, nil
+			}
 			continue
 		}
 		if payload == "[DONE]" {
@@ -501,6 +506,9 @@ func readSSE(r io.Reader, onData func([]byte) error) (*Usage, error) {
 		}
 		if derr := onData([]byte(payload)); derr != nil {
 			return usage, derr
+		}
+		if err == io.EOF {
+			return usage, nil
 		}
 	}
 }
