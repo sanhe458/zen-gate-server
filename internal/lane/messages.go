@@ -88,13 +88,35 @@ func ToChatMessages(messages []Message) []map[string]any {
 			}
 		case RoleUser:
 			text := ""
+			// A tool result may be packed inside a user turn: the Anthropic
+			// wire has no "tool" role, Claude-protocol clients send results as
+			// tool_result blocks on a user message. The chat wire needs each of
+			// them as its own "tool" message — dropping them left the
+			// assistant's tool_call unanswered upstream (400), so a Claude
+			// client talking to a chat-wire model broke on the first tool
+			// round trip.
+			results := []map[string]any{}
 			for _, p := range m.Parts {
 				switch t := p.(type) {
 				case TextPart:
 					text += t.Text
 				case ImagePart:
 					pendingImages = append(pendingImages, t.DataURL)
+				case ToolResultPart:
+					results = append(results, map[string]any{
+						"role": "tool", "tool_call_id": t.ToolCallID, "content": t.Text,
+					})
 				}
+			}
+			// The chat wire requires a tool message to directly follow the
+			// assistant turn whose tool_call it answers, so results are emitted
+			// before any text of the same turn (the Anthropic wire packs both
+			// into one user turn).
+			out = append(out, results...)
+			if len(results) > 0 && text == "" && len(pendingImages) == 0 {
+				// results-only turn: the tool messages *are* the turn, and an
+				// empty user message after them would be noise
+				continue
 			}
 			content := any(text)
 			if len(pendingImages) > 0 && text == "" {
@@ -255,14 +277,26 @@ func ToResponseInput(messages []Message) (instructions string, out []map[string]
 		case RoleUser:
 			text := ""
 			items := []map[string]any{}
+			// Tool results packed into a user turn (Anthropic-shaped input)
+			// become top-level function_call_output items — the Responses wire
+			// pairs them with the function_call by call_id, so dropping them
+			// left the call unanswered.
+			outputs := []map[string]any{}
 			for _, p := range m.Parts {
 				switch t := p.(type) {
 				case TextPart:
 					text += t.Text
 				case ImagePart:
 					items = append(items, map[string]any{"type": "input_image", "image_url": t.DataURL})
+				case ToolResultPart:
+					outputs = append(outputs, map[string]any{
+						"type": "function_call_output", "call_id": t.ToolCallID, "output": t.Text,
+					})
 				}
 			}
+			// function_call_output items must follow the function_call they
+			// answer, so they come before any text of the same turn.
+			out = append(out, outputs...)
 			if strings.TrimSpace(text) != "" || len(items) > 0 {
 				if strings.TrimSpace(text) != "" {
 					items = append([]map[string]any{{"type": "input_text", "text": text}}, items...)

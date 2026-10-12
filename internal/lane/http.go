@@ -144,6 +144,22 @@ func parseProxyURL(raw string) (*neturl.URL, error) {
 	return neturl.Parse(raw)
 }
 
+// ParseProxyURL is the exported form of the normalisation SetProxy applies to
+// a user-entered address: a scheme-less "host:port" is accepted and read as
+// HTTP. Callers that validate a proxy before it is saved (the dashboard's
+// connectivity test) must use it too, or they end up rejecting the very
+// spelling the gateway happily accepts.
+func ParseProxyURL(raw string) (*neturl.URL, error) {
+	u, err := parseProxyURL(raw)
+	if err != nil {
+		return nil, err
+	}
+	if u.Host == "" {
+		return nil, errors.New("proxy url has no host")
+	}
+	return u, nil
+}
+
 // PostStreamed posts one completion request and delivers decoded `data:`
 // payloads to onData. The first ≤4 KiB are sniffed by body shape — the gateway
 // sometimes answers a stream request with SSE under an application/json
@@ -350,8 +366,15 @@ func newStreamReader(ctx context.Context, src io.Reader, idle time.Duration) *st
 		}
 	}()
 	go func() {
-		<-ctx.Done()
-		s.Close()
+		// Also exit when the reader is closed: with a context that never
+		// cancels (context.Background(), used by the on-demand /admin probe)
+		// ctx.Done() is a nil channel and blocking on it alone would leak this
+		// goroutine for every single call.
+		select {
+		case <-ctx.Done():
+			s.Close()
+		case <-s.done:
+		}
 	}()
 	return s
 }

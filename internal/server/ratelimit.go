@@ -81,14 +81,6 @@ func (l *ipRateLimiter) gcLocked(now time.Time) {
 	}
 }
 
-// tracked reports how many addresses the limiter is currently holding (used by
-// tests and the dashboard).
-func (l *ipRateLimiter) tracked() int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return len(l.hits)
-}
-
 // clientIP resolves the caller's address. Forwarding headers are honoured only
 // when the direct peer sits on a trusted network (loopback or private range) —
 // otherwise a public caller could spoof X-Forwarded-For and mint itself a fresh

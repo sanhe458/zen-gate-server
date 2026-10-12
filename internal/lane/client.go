@@ -46,7 +46,14 @@ type CallRecord struct {
 	DecodeMs  int64  `json:"decodeMs,omitempty"`
 	DecodeTok int    `json:"decodeTokens,omitempty"`
 	Effort    string `json:"effort,omitempty"`
-	At        int64  `json:"at"`
+	// LatencyMs is the wall-clock duration of the whole attempt (first byte
+	// included) — what the dashboard's 耗时 column reports. It used to be
+	// missing entirely, so the column could only ever render "–".
+	LatencyMs int64 `json:"latencyMs,omitempty"`
+	// Error is the failure detail for an unsuccessful attempt, shown as the
+	// hover text next to the ✗ mark.
+	Error string `json:"error,omitempty"`
+	At    int64  `json:"at"`
 }
 
 // Lane orchestrates the free lane: catalog, availability, and completion calls.
@@ -262,7 +269,16 @@ func (l *Lane) ServableModels() []ModelInfo {
 		out = append(out, m)
 	}
 	if len(out) == 0 && len(cat) > 0 {
-		out = cat
+		// Last-resort fallback: never hand back an empty list while a model is
+		// known. Decision models stay out even here — they answer typed
+		// questions on their own wire and a chat request against one can only
+		// fail, so advertising one would just move the error downstream.
+		for _, m := range cat {
+			if m.SystemOne {
+				continue
+			}
+			out = append(out, m)
+		}
 	}
 	return out
 }
@@ -671,9 +687,21 @@ func (l *Lane) attemptModel(ctx context.Context, req Request, model, effort stri
 		result.Usage = *usage
 	}
 	sawAny := result.SawText || result.SawToolCall || result.SawReasoning
-	l.record(CallRecord{Model: base, Ok: false, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, result, err, firstAt)
+	// rec emits exactly one CallRecord per physical upstream request. There
+	// used to be an unconditional record before the branches below *and*
+	// another one on the success/recovery paths, so every completed turn was
+	// counted twice in the usage stats (requests, tokens and the recent-calls
+	// list all doubled).
+	rec := func(extra CallRecord, res StreamResult, rerr error, total time.Duration) {
+		extra.Model = base
+		extra.Effort = effort
+		extra.Agent = req.Agent
+		extra.At = time.Now().UnixMilli()
+		l.record(extra, res, rerr, firstAt, total)
+	}
 
 	if err != nil {
+		rec(CallRecord{}, result, err, time.Since(start))
 		uerr := asUpstream(err)
 		if uerr.Code == CodeQuota {
 			l.MarkThrottled(base, uerr.RetryAfter)
@@ -682,7 +710,7 @@ func (l *Lane) attemptModel(ctx context.Context, req Request, model, effort stri
 	}
 	if result.SawFinish {
 		l.MarkOK(base)
-		l.record(CallRecord{Model: base, Ok: true, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, result, nil, firstAt)
+		rec(CallRecord{}, result, nil, time.Since(start))
 		return Outcome{Usage: result.Usage, Finish: result.Finish}, nil, true
 	}
 
@@ -690,15 +718,17 @@ func (l *Lane) attemptModel(ctx context.Context, req Request, model, effort stri
 	// a mid-content cut is a property of this turn's length, and re-sending
 	// would pay the same five minutes again.
 	elapsed := time.Since(start).Milliseconds()
+	const cutMessage = "upstream closed the stream without a finish token"
 	if !canRecover(result, elapsed) {
-		l.record(CallRecord{Model: base, Ok: false, Truncated: true, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, result, nil, firstAt)
-		return Outcome{Usage: result.Usage}, &UpstreamError{Code: CodeTransport, Message: "upstream closed the stream without a finish token"}, sawAny
+		rec(CallRecord{Truncated: true, Error: cutMessage}, result, nil, time.Since(start))
+		return Outcome{Usage: result.Usage}, &UpstreamError{Code: CodeTransport, Message: cutMessage}, sawAny
 	}
 
 	recovBudget := min2(RecoveryMaxOutputTokens, budget-result.Usage.Output)
 	if recovBudget < 512 || !checkpointFits(messages, *entry, result.ReasoningText, recovBudget) {
-		l.record(CallRecord{Model: base, Ok: false, Truncated: true, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, result, nil, firstAt)
-		return Outcome{Usage: result.Usage}, &UpstreamError{Code: CodeTransport, Message: "upstream cut a pure-reasoning turn; recovery does not fit the context"}, sawAny
+		const msg = "upstream cut a pure-reasoning turn; recovery does not fit the context"
+		rec(CallRecord{Truncated: true, Error: msg}, result, nil, time.Since(start))
+		return Outcome{Usage: result.Usage}, &UpstreamError{Code: CodeTransport, Message: msg}, sawAny
 	}
 	recMsgs := append(append([]Message{}, messages...), Message{Role: RoleUser, Parts: []Part{
 		TextPart{Text: recoveryInstruction + jsonString(result.ReasoningText)},
@@ -724,11 +754,11 @@ func (l *Lane) attemptModel(ctx context.Context, req Request, model, effort stri
 	if rerr == nil && recResult.SawFinish && recResult.Finish == FinishStop && recResult.SawText {
 		recResult.Usage.Merge(&result.Usage)
 		l.MarkOK(base)
-		l.record(CallRecord{Model: base, Ok: true, Recovered: true, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, recResult, nil, firstAt)
+		rec(CallRecord{Recovered: true}, recResult, nil, time.Since(start))
 		return Outcome{Usage: recResult.Usage, Finish: recResult.Finish, Recovered: true}, nil, true
 	}
 	recResult.Usage.Merge(&result.Usage)
-	l.record(CallRecord{Model: base, Ok: false, Truncated: true, Effort: effort, Agent: req.Agent, At: time.Now().UnixMilli()}, recResult, rerr, firstAt)
+	rec(CallRecord{Truncated: true, Error: "upstream cut the stream; recovery did not complete"}, recResult, rerr, time.Since(start))
 	if rerr != nil {
 		uerr := asUpstream(rerr)
 		if uerr.Code == CodeQuota {
@@ -739,12 +769,15 @@ func (l *Lane) attemptModel(ctx context.Context, req Request, model, effort stri
 	return Outcome{Usage: recResult.Usage}, &UpstreamError{Code: CodeTransport, Message: "upstream cut the stream; recovery did not complete"}, true
 }
 
-func (l *Lane) record(rec CallRecord, result StreamResult, err error, firstAt int64) {
+func (l *Lane) record(rec CallRecord, result StreamResult, err error, firstAt int64, total time.Duration) {
 	if l.OnCall == nil {
 		return
 	}
 	if err != nil {
 		rec.Ok = false
+		if rec.Error == "" {
+			rec.Error = truncate(err.Error(), 300)
+		}
 	} else {
 		rec.Ok = result.SawFinish
 	}
@@ -753,6 +786,7 @@ func (l *Lane) record(rec CallRecord, result StreamResult, err error, firstAt in
 	rec.Reasoning = result.Usage.Reasoning
 	rec.CacheRead = result.Usage.CacheRead
 	rec.TTFTMs = firstAt
+	rec.LatencyMs = total.Milliseconds()
 	if result.SawText {
 		rec.DecodeTok = WindowTokens(result.Usage, result.SawReasoning)
 	}

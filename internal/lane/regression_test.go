@@ -3,9 +3,12 @@ package lane
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -442,4 +445,169 @@ func TestLaneSettingsConcurrentWithListings(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 	close(stop)
 	wg.Wait()
+}
+
+// TestCallRecordOncePerPhysicalRequest pins the usage-accounting fix: the
+// record for a completed attempt was emitted twice — once unconditionally
+// before the outcome branches and once on the success path — so every
+// finished turn doubled in the stats (requests, input/output tokens and the
+// recent-calls list the dashboard renders). One physical upstream request
+// must produce exactly one CallRecord.
+func TestCallRecordOncePerPhysicalRequest(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "text/event-stream")
+		fmt.Fprint(w, chatSSE(
+			`{"choices":[{"delta":{"role":"assistant","content":"hi"}}]}`,
+			`{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":3}}`,
+		))
+	}))
+	defer srv.Close()
+	old := UpstreamBase
+	UpstreamBase = srv.URL
+	defer func() { UpstreamBase = old }()
+
+	l := NewLane()
+	var calls []CallRecord
+	l.OnCall = func(rec CallRecord) { calls = append(calls, rec) }
+
+	out, uerr := l.Complete(context.Background(), Request{
+		Model:    "mimo-v2.6-flash-free",
+		Messages: []Message{{Role: RoleUser, Parts: []Part{TextPart{Text: "hi"}}}},
+	}, func(Chunk) {})
+	if uerr != nil {
+		t.Fatalf("Complete: %v", uerr)
+	}
+	if out.Finish != FinishStop {
+		t.Fatalf("finish = %q", out.Finish)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("one upstream request produced %d records, want 1: %+v", len(calls), calls)
+	}
+	if !calls[0].Ok || calls[0].Input != 5 || calls[0].Output != 3 {
+		t.Fatalf("record mangled: %+v", calls[0])
+	}
+}
+
+// TestStreamReaderWatcherExitsWithReader pins the goroutine leak: the pump
+// spawned a watcher that only waited on ctx.Done(). With a context that never
+// cancels — context.Background(), which the on-demand /admin probe passes —
+// ctx.Done() is a nil channel, so every single call leaked that goroutine for
+// the life of the process. It must also exit when the reader is closed, which
+// is what this counts: N calls must not leave N goroutines behind.
+func TestStreamReaderWatcherExitsWithReader(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "text/event-stream")
+		fmt.Fprint(w, chatSSE(
+			`{"choices":[{"delta":{"content":"hi"}}]}`,
+			`{"choices":[{"delta":{},"finish_reason":"stop"}]}`,
+		))
+	}))
+	defer srv.Close()
+	old := UpstreamBase
+	UpstreamBase = srv.URL
+	defer func() { UpstreamBase = old }()
+
+	body := map[string]any{"model": "m", "stream": true}
+	// warm the transport up so its own lazily-started goroutines are not
+	// counted as a leak
+	if _, err := PostStreamed(context.Background(), "/zen/v1/chat/completions", body,
+		"ses_warm", "msg_warm", func([]byte) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	runtime.GC()
+	time.Sleep(100 * time.Millisecond)
+	before := runtime.NumGoroutine()
+
+	const n = 20
+	for i := 0; i < n; i++ {
+		if _, err := PostStreamed(context.Background(), "/zen/v1/chat/completions", body,
+			"ses_leak", "msg_leak", func([]byte) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	leaked := 0
+	for i := 0; i < 40; i++ {
+		runtime.GC()
+		time.Sleep(50 * time.Millisecond)
+		if leaked = runtime.NumGoroutine() - before; leaked <= 2 {
+			return
+		}
+	}
+	t.Fatalf("%d calls leaked %d goroutines (watcher does not exit with the reader)", n, leaked)
+}
+
+// TestToolResultInUserTurnProjectedToEveryWire pins the cross-protocol fix:
+// the Anthropic wire carries tool results as tool_result blocks on a *user*
+// turn (there is no tool role). ToChatMessages/ToResponseInput only looked for
+// them on a tool-role message, so a Claude-protocol client talking to a
+// chat- or responses-wire model had every tool result silently dropped — and
+// an empty user turn appended in its place. Upstream then answers 400 for the
+// unanswered tool_call.
+func TestToolResultInUserTurnProjectedToEveryWire(t *testing.T) {
+	unified := RepairToolPairing([]Message{
+		{Role: RoleUser, Parts: []Part{TextPart{Text: "list files"}}},
+		{Role: RoleAssistant, Parts: []Part{ToolCallPart{ID: "toolu_1", Name: "bash", Arguments: `{"cmd":"ls"}`}}},
+		{Role: RoleUser, Parts: []Part{
+			ToolResultPart{ToolCallID: "toolu_1", Text: "a.txt"},
+			TextPart{Text: "go on"},
+		}},
+	})
+
+	chat, _ := json.Marshal(ToChatMessages(unified))
+	if !strings.Contains(string(chat), `"role":"tool"`) || !strings.Contains(string(chat), "a.txt") {
+		t.Errorf("chat wire lost the tool result: %s", chat)
+	}
+	if strings.Contains(string(chat), `"content":"","role":"user"`) {
+		t.Errorf("chat wire appended an empty user turn: %s", chat)
+	}
+	// the tool message must follow the assistant tool_call directly, ahead of
+	// the user text of the same turn, or upstream rejects the request
+	toolAt := strings.Index(string(chat), `"role":"tool"`)
+	textAt := strings.Index(string(chat), "go on")
+	if toolAt < 0 || textAt < 0 || toolAt > textAt {
+		t.Errorf("chat wire ordered the tool result after the user text: %s", chat)
+	}
+
+	_, resp := ToResponseInput(unified)
+	raw, _ := json.Marshal(resp)
+	if !strings.Contains(string(raw), "function_call_output") || !strings.Contains(string(raw), "a.txt") {
+		t.Errorf("responses wire lost the tool result: %s", raw)
+	}
+	outAt := strings.Index(string(raw), "function_call_output")
+	textAt = strings.Index(string(raw), "go on")
+	if outAt < 0 || textAt < 0 || outAt > textAt {
+		t.Errorf("responses wire ordered function_call_output after the user item: %s", raw)
+	}
+
+	// The native Anthropic projection was already correct and must stay so.
+	_, claude := ToClaudeMessages(unified)
+	craw, _ := json.Marshal(claude)
+	if !strings.Contains(string(craw), "tool_result") || !strings.Contains(string(craw), "a.txt") {
+		t.Errorf("claude wire lost the tool result: %s", craw)
+	}
+}
+
+// TestServableModelsFallbackKeepsDecisionModelsOut pins the fallback fix: when
+// every model is unavailable or region-gated the picker falls back to the
+// whole catalog, which also re-admitted the System One decision models the
+// main loop deliberately skips — a chat request against one can only fail.
+func TestServableModelsFallbackKeepsDecisionModelsOut(t *testing.T) {
+	l := NewLane()
+	l.mu.Lock()
+	l.catalog = BuildCatalog([]string{"mimo-v2.6-flash-free", "jev-1.13-free"})
+	l.availability = map[string]ProbeResult{
+		"mimo-v2.6-flash-free": {Model: "mimo-v2.6-flash-free", State: StateUnavailable},
+		"jev-1.13-free":        {Model: "jev-1.13-free", State: StateUnavailable},
+	}
+	l.mu.Unlock()
+
+	got := l.ServableModels()
+	for _, m := range got {
+		if m.SystemOne {
+			t.Fatalf("fallback advertised the decision model %s as a chat model", m.ID)
+		}
+	}
+	if len(got) != 1 {
+		t.Fatalf("fallback listed %d models, want the 1 non-decision model", len(got))
+	}
 }

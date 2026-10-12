@@ -825,6 +825,12 @@ setInterval(()=>{if(document.getElementById("p-logs").classList.contains("on")&&
 /* ---------- settings ---------- */
 function fillSettings(){
   if(!S)return;
+  // applyState() runs on every 5s poll. Re-writing the inputs unconditionally
+  // wiped whatever the operator had typed but not yet saved (a port, a proxy
+  // URL…), so skip while the settings form holds focus — the pool form is
+  // filled once for the same reason.
+  const a=document.activeElement, pane=$("p-settings");
+  if(a&&pane&&pane.contains(a))return;
   const s=S.settings;
   $("fMaxTok").value=s.defaultMaxTokens;
   $("fEffort").value=s.defaultEffort;

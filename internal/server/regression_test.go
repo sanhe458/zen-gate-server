@@ -2,12 +2,14 @@ package server
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"zen-gate-server/internal/lane"
+	"zen-gate-server/internal/store"
 )
 
 // TestConvertResponsesInputDeveloperRole pins the role mapping fix: the
@@ -123,5 +125,118 @@ func TestAdminSettingsRejectsCustomProxyWithoutURL(t *testing.T) {
 	if got := s.Store.Config(); got.ProxyMode != "custom" || got.ProxyURL != "http://127.0.0.1:9999" ||
 		got.DefaultEffort != "light" {
 		t.Fatalf("valid save not applied: %+v", got)
+	}
+}
+
+// TestAdminImportAppliesAndPersists pins the import fix: the handler wrote the
+// uploaded config onto Store.Config()'s result — a private snapshot, since the
+// config became copy-on-write — and then persisted the untouched live config.
+// The endpoint answered {"ok":true} while changing nothing, in memory or on
+// disk, so a restored backup was silently ignored.
+func TestAdminImportAppliesAndPersists(t *testing.T) {
+	s := newTestServer(t)
+	incoming := *s.Store.Config()
+	incoming.DefaultEffort = "deep"
+	incoming.DefaultMaxTokens = 12345
+	incoming.ProbeIntervalMinutes = 99
+	incoming.MainKey = "ofm-imported"
+	// bind/port are pinned by the handler and must survive the import
+	incoming.Port = 9999
+	incoming.ListenHost = "0.0.0.0"
+	raw, err := json.Marshal(incoming)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := httptest.NewRequest(http.MethodPost, "/admin/api/import", strings.NewReader(string(raw)))
+	r.RemoteAddr = "127.0.0.1:5555"
+	r.Header.Set("Content-Type", "application/json")
+	if w := do(t, s, r); w.Code != 200 {
+		t.Fatalf("import status %d: %s", w.Code, w.Body.String())
+	}
+
+	live := s.Store.Config()
+	if live.DefaultEffort != "deep" || live.DefaultMaxTokens != 12345 || live.ProbeIntervalMinutes != 99 {
+		t.Fatalf("import was not applied: %+v", live)
+	}
+	if live.Port == 9999 || live.ListenHost == "0.0.0.0" {
+		t.Fatalf("import changed the live bind (port=%d host=%q)", live.Port, live.ListenHost)
+	}
+	// the running lane must follow the imported values, not just the file
+	req := httptest.NewRequest(http.MethodGet, "/admin/api/state", nil)
+	req.RemoteAddr = "127.0.0.1:5555"
+	w := do(t, s, req)
+	if !strings.Contains(w.Body.String(), `"defaultMaxTokens":12345`) {
+		t.Fatalf("imported value not visible in /state: %s", w.Body.String())
+	}
+
+	// and it must survive a restart
+	reopened, err := store.Open()
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	if got := reopened.Config(); got.DefaultEffort != "deep" || got.DefaultMaxTokens != 12345 {
+		t.Fatalf("import was not persisted: %+v", got)
+	}
+}
+
+// TestStateShipsEveryFieldTheDashboardReads pins the two /state gaps the SPA
+// renders against: model rows carried no regionSensitive flag (so the
+// 地区敏感 badge never appeared) and the settings block had no anonymousRpm
+// (so the 匿名调用限速 field always showed the fallback 60 and saving the form
+// overwrote the real value — silently re-enabling keyless access that had been
+// switched off with 0).
+func TestStateShipsEveryFieldTheDashboardReads(t *testing.T) {
+	s := newTestServer(t)
+	s.Store.Update(func(c *store.Config) { c.AnonymousRPM = 7 })
+
+	r := httptest.NewRequest(http.MethodGet, "/admin/api/state", nil)
+	r.RemoteAddr = "127.0.0.1:5555"
+	w := do(t, s, r)
+	if w.Code != 200 {
+		t.Fatalf("state status %d", w.Code)
+	}
+	var payload struct {
+		Settings map[string]any   `json:"settings"`
+		Models   []map[string]any `json:"models"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode state: %v", err)
+	}
+	if got, ok := payload.Settings["anonymousRpm"]; !ok {
+		t.Error("/state settings is missing anonymousRpm (dashboard would save a stale 60)")
+	} else if n, _ := got.(float64); int(n) != 7 {
+		t.Errorf("anonymousRpm = %v, want 7", got)
+	}
+	if len(payload.Models) == 0 {
+		t.Fatal("no models in state")
+	}
+	if _, ok := payload.Models[0]["regionSensitive"]; !ok {
+		t.Error("/state model rows are missing regionSensitive (地区敏感 badge can never render)")
+	}
+}
+
+// TestProxyTestAcceptsSchemelessAddress pins the validation mismatch: the
+// settings page happily saves "127.0.0.1:7890" and the lane normalises it to
+// http://, but the connectivity test parsed the raw string and rejected the
+// very spelling the gateway accepts as "代理地址不合法".
+func TestProxyTestAcceptsSchemelessAddress(t *testing.T) {
+	if u, err := lane.ParseProxyURL("127.0.0.1:7890"); err != nil || u.Scheme != "http" || u.Host != "127.0.0.1:7890" {
+		t.Fatalf("lane.ParseProxyURL(\"127.0.0.1:7890\") = %v, %v", u, err)
+	}
+	s := newTestServer(t)
+	// A reachable proxy is not required: the assertion is that the address is
+	// accepted and an upstream attempt is made, rather than a 400.
+	withFakeUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		_, _ = io.WriteString(w, `{"data":[]}`)
+	})
+	r := httptest.NewRequest(http.MethodPost, "/admin/api/proxy-test",
+		strings.NewReader(`{"mode":"custom","url":"127.0.0.1:1"}`))
+	r.RemoteAddr = "127.0.0.1:5555"
+	r.Header.Set("Content-Type", "application/json")
+	w := do(t, s, r)
+	if w.Code == 400 {
+		t.Fatalf("schemeless proxy address rejected: %s", w.Body.String())
 	}
 }

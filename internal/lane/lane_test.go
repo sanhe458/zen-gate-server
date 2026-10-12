@@ -40,7 +40,8 @@ func TestSessionForConversationStable(t *testing.T) {
 
 func TestRequestIdForStablePerTurn(t *testing.T) {
 	s := SessionForConversation("c1")
-	if RequestIdFor(s, "turn-1") != RequestIdFor(s, "turn-1") {
+	first := RequestIdFor(s, "turn-1")
+	if again := RequestIdFor(s, "turn-1"); again != first {
 		t.Fatal("retries of one turn must share a request id")
 	}
 	if RequestIdFor(s, "turn-1") == RequestIdFor(s, "turn-2") {

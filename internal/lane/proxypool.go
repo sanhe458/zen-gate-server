@@ -1122,33 +1122,6 @@ func httpGetBody(ctx context.Context, client *http.Client, url string) ([]byte, 
 	return io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 }
 
-// extractJSONStrings salvages "host:port" strings from a JSON line.
-func extractJSONStrings(line string) []string {
-	var arr []map[string]any
-	if err := json.Unmarshal([]byte(line), &arr); err == nil {
-		out := []string{}
-		for _, m := range arr {
-			ip, _ := m["ip"].(string)
-			port := ""
-			switch v := m["port"].(type) {
-			case float64:
-				port = fmt.Sprintf("%.0f", v)
-			case string:
-				port = v
-			}
-			if ip != "" && port != "" {
-				out = append(out, ip+":"+port)
-			}
-		}
-		return out
-	}
-	var strs []string
-	if err := json.Unmarshal([]byte(line), &strs); err == nil {
-		return strs
-	}
-	return nil
-}
-
 // --- persistence --------------------------------------------------------------
 
 // SetStorage points the pool at a JSON file used to carry the tested set

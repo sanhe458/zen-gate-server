@@ -119,12 +119,13 @@ type ShareStat struct {
 	Output   int `json:"output"`
 }
 
-// Stats is the persisted usage accounting.
+// Stats is the persisted usage accounting. Guarding it is Store.mu — a mutex
+// field here would be misleading (nothing locks it) and would make the struct
+// uncopyable for no reason.
 type Stats struct {
 	Version int                 `json:"version"`
 	Days    map[string]*DayStat `json:"days"`
 	Recent  []lane.CallRecord   `json:"recent,omitempty"`
-	mu      sync.Mutex
 	dirty   bool
 }
 

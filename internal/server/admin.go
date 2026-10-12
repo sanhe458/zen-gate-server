@@ -248,19 +248,21 @@ func (s *Server) adminState(w http.ResponseWriter) {
 	cfg := s.Store.Config()
 	cat, av, egress := s.Lane.Snapshot()
 	type modelRow struct {
-		ID            string             `json:"id"`
-		Name          string             `json:"name"`
-		Blurb         string             `json:"blurb,omitempty"`
-		State         string             `json:"state"`
-		Detail        string             `json:"detail,omitempty"`
-		TTFTMs        int64              `json:"ttftMs,omitempty"`
-		LatencyMs     int64              `json:"latencyMs,omitempty"`
-		Vision        bool               `json:"vision"`
-		Reasoning     bool               `json:"reasoning"`
-		SystemOne     bool               `json:"systemOne"`
-		ContextWindow int                `json:"contextWindow"`
-		MaxOutput     int                `json:"maxOutput"`
-		Efforts       []lane.LevelBudget `json:"efforts"`
+		ID            string `json:"id"`
+		Name          string `json:"name"`
+		Blurb         string `json:"blurb,omitempty"`
+		State         string `json:"state"`
+		Detail        string `json:"detail,omitempty"`
+		TTFTMs        int64  `json:"ttftMs,omitempty"`
+		LatencyMs     int64  `json:"latencyMs,omitempty"`
+		Vision        bool   `json:"vision"`
+		Reasoning     bool   `json:"reasoning"`
+		SystemOne     bool   `json:"systemOne"`
+		ContextWindow int    `json:"contextWindow"`
+		MaxOutput     int    `json:"maxOutput"`
+		// RegionSensitive drives the 地区敏感 badge on the model cards.
+		RegionSensitive bool               `json:"regionSensitive"`
+		Efforts         []lane.LevelBudget `json:"efforts"`
 		// Observed-quota fields (no official balance API exists upstream).
 		QuotaUsed     int   `json:"quotaUsed,omitempty"`
 		QuotaEstimate int   `json:"quotaEstimate,omitempty"`
@@ -280,8 +282,9 @@ func (s *Server) adminState(w http.ResponseWriter) {
 			ID: m.ID, Name: m.Name, Blurb: m.Blurb, State: stateOrDefault(p), Detail: p.Detail,
 			TTFTMs: p.TTFTMs, LatencyMs: p.LatencyMs,
 			Vision: m.Vision, Reasoning: m.Reasoning,
-			SystemOne:     m.SystemOne,
-			ContextWindow: m.ContextWindow, MaxOutput: m.MaxOutput,
+			SystemOne:       m.SystemOne,
+			RegionSensitive: m.RegionSensitive,
+			ContextWindow:   m.ContextWindow, MaxOutput: m.MaxOutput,
 			Efforts: lane.EffortsFor(m, 0, cfg.DefaultMaxTokens),
 		}
 		row.TTFTAvgMs, row.TTFTCount = s.Store.TTFTStats(m.ID)
@@ -324,6 +327,7 @@ func (s *Server) adminState(w http.ResponseWriter) {
 			"failoverMax":             cfg.FailoverMax,
 			"listenHost":              cfg.ListenHost,
 			"hasPassword":             strings.TrimSpace(cfg.WebUIPassword) != "",
+			"anonymousRpm":            cfg.AnonymousRPM,
 			"proxyPoolEnabled":        cfg.ProxyPoolEnabled,
 			"proxyPoolAutoRotate":     cfg.ProxyPoolAutoRotate,
 			"proxyPoolMinUsable":      cfg.ProxyPoolMinUsable,
@@ -602,8 +606,11 @@ func (s *Server) adminProxyTest(w http.ResponseWriter, r *http.Request) {
 	case "direct":
 		transport.Proxy = nil
 	case "custom":
-		u, err := neturl.Parse(strings.TrimSpace(proxyURL))
-		if err != nil || u.Host == "" {
+		// Use the lane's own normalisation: it accepts a scheme-less
+		// "host:port" (the spelling the settings page happily saves), so the
+		// test button must not reject an address the gateway would use.
+		u, err := lane.ParseProxyURL(proxyURL)
+		if err != nil {
 			writeJSON(w, 400, map[string]any{"ok": false, "error": "代理地址不合法"})
 			return
 		}
@@ -722,11 +729,14 @@ func (s *Server) adminImport(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"ok": false, "error": "配置缺少 MainKey 或端口不合法"})
 		return
 	}
-	cfg := s.Store.Config()
-	incoming.Port = cfg.Port
-	incoming.ListenHost = cfg.ListenHost
+	live := s.Store.Config()
+	incoming.Port = live.Port
+	incoming.ListenHost = live.ListenHost
 	if incoming.AgentKeys == nil {
 		incoming.AgentKeys = map[string]string{}
+	}
+	if incoming.ShareKeys == nil {
+		incoming.ShareKeys = map[string]string{}
 	}
 	if incoming.EnabledAgents == nil {
 		incoming.EnabledAgents = map[string]bool{}
@@ -743,8 +753,19 @@ func (s *Server) adminImport(w http.ResponseWriter, r *http.Request) {
 	if incoming.ProxyMode == "" {
 		incoming.ProxyMode = "env"
 	}
-	*cfg = incoming
-	_ = s.Store.Save()
+	// The swap must go through Store.Update: Config() hands out a private
+	// snapshot, so the previous `*cfg = incoming` wrote to a copy and Save()
+	// then persisted the untouched live config — the import reported success
+	// and changed nothing at all.
+	s.Store.Update(func(c *store.Config) { *c = incoming })
+	// Push the knobs the running lane caches, so the import takes effect
+	// without a restart (a plain config swap only affects future readers).
+	s.Lane.SetDefaultMaxTokens(incoming.DefaultMaxTokens)
+	s.Lane.SetExposeRegion(incoming.ExposeRegion)
+	s.Lane.SetFailover(incoming.FailoverEnabled, incoming.FailoverMax)
+	if !incoming.ProxyPoolEnabled {
+		lane.SetProxy(incoming.ProxyMode, incoming.ProxyURL)
+	}
 	if s.logger != nil {
 		s.logger.Infof("配置已导入；端口/监听地址保持不变")
 	}
