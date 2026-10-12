@@ -128,11 +128,14 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request, rest string
 	case rest == "settings" && r.Method == http.MethodPost:
 		s.adminSettings(w, r)
 	case rest == "reprobe" && r.Method == http.MethodPost:
-		go s.Lane.ProbeRound(r.Context(), true)
+		// Background work must not ride the request context: net/http cancels
+		// it the moment this handler returns, which aborted the probe round
+		// before its first model. The other background kicks (pool rotate/use)
+		// already use context.Background().
+		go s.Lane.ProbeRound(context.Background(), true)
 		writeJSON(w, 200, map[string]any{"ok": true})
 	case rest == "key/rotate" && r.Method == http.MethodPost:
-		s.Store.Config().MainKey = store.GenerateKey("")
-		_ = s.Store.Save()
+		s.Store.Update(func(c *store.Config) { c.MainKey = store.GenerateKey("") })
 		if s.logger != nil {
 			s.logger.Infof("主 API Key 已轮换")
 		}
@@ -408,156 +411,169 @@ func (s *Server) adminSettings(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": err.Error()})
 		return
 	}
-	cfg := s.Store.Config()
 	changed := false
 	restartNote := false
-	if in.Port != nil && *in.Port > 0 && *in.Port < 65536 && *in.Port != cfg.Port {
-		cfg.Port = *in.Port
-		changed = true
-		restartNote = true
+	// Validate before touching the store: a rejected save must apply nothing
+	// (an early return inside the Update closure would only skip the swap —
+	// it could not stop the response from being written twice).
+	if in.ProxyMode != nil && *in.ProxyMode == "custom" &&
+		(in.ProxyURL == nil || strings.TrimSpace(*in.ProxyURL) == "") &&
+		strings.TrimSpace(s.Store.Config().ProxyURL) == "" {
+		writeJSON(w, 400, map[string]any{"ok": false, "error": "自定义代理需要填写代理地址"})
+		return
 	}
-	if in.ListenHost != nil {
-		h := strings.TrimSpace(*in.ListenHost)
-		if h == "" || h == "127.0.0.1" || h == "localhost" || h == "0.0.0.0" || h == "::" || net.ParseIP(h) != nil {
-			if h == "localhost" {
-				h = "127.0.0.1"
-			}
-			if cfg.ListenHost != h {
-				cfg.ListenHost = h
-				changed = true
-				restartNote = true
-			}
-		}
-	}
-	if in.WebUIPassword != nil {
-		pw := strings.TrimSpace(*in.WebUIPassword)
-		if pw != cfg.WebUIPassword {
-			cfg.WebUIPassword = pw
+	// Every mutation happens inside Update: the config is copy-on-write, so
+	// writing the live struct directly would race with /v1 readers (and a
+	// concurrent map write is a fatal error, not a warning).
+	s.Store.Update(func(cfg *store.Config) {
+		if in.Port != nil && *in.Port > 0 && *in.Port < 65536 && *in.Port != cfg.Port {
+			cfg.Port = *in.Port
 			changed = true
+			restartNote = true
 		}
-	}
-	if in.DefaultMaxTokens != nil && *in.DefaultMaxTokens > 0 {
-		cfg.DefaultMaxTokens = *in.DefaultMaxTokens
-		s.Lane.SetDefaultMaxTokens(*in.DefaultMaxTokens)
-		changed = true
-	}
-	if in.DefaultEffort != nil {
-		switch *in.DefaultEffort {
-		case "light", "balanced", "deep":
-			cfg.DefaultEffort = *in.DefaultEffort
-			changed = true
-		}
-	}
-	if in.ProbeIntervalMinutes != nil && *in.ProbeIntervalMinutes > 0 {
-		cfg.ProbeIntervalMinutes = *in.ProbeIntervalMinutes
-		changed = true
-	}
-	if in.ExposeRegion != nil {
-		cfg.ExposeRegion = *in.ExposeRegion
-		s.Lane.SetExposeRegion(*in.ExposeRegion)
-		changed = true
-	}
-	if in.ProxyMode != nil {
-		switch *in.ProxyMode {
-		case "env", "direct", "custom", "system":
-			if *in.ProxyMode == "custom" && (in.ProxyURL == nil || strings.TrimSpace(*in.ProxyURL) == "") && strings.TrimSpace(cfg.ProxyURL) == "" {
-				writeJSON(w, 400, map[string]any{"ok": false, "error": "自定义代理需要填写代理地址"})
-				return
-			}
-			if cfg.ProxyMode != *in.ProxyMode || (in.ProxyURL != nil && cfg.ProxyURL != *in.ProxyURL) {
-				cfg.ProxyMode = *in.ProxyMode
-				if in.ProxyURL != nil {
-					cfg.ProxyURL = strings.TrimSpace(*in.ProxyURL)
+		if in.ListenHost != nil {
+			h := strings.TrimSpace(*in.ListenHost)
+			if h == "" || h == "127.0.0.1" || h == "localhost" || h == "0.0.0.0" || h == "::" || net.ParseIP(h) != nil {
+				if h == "localhost" {
+					h = "127.0.0.1"
 				}
-				lane.SetProxy(cfg.ProxyMode, cfg.ProxyURL)
+				if cfg.ListenHost != h {
+					cfg.ListenHost = h
+					changed = true
+					restartNote = true
+				}
+			}
+		}
+		if in.WebUIPassword != nil {
+			pw := strings.TrimSpace(*in.WebUIPassword)
+			if pw != cfg.WebUIPassword {
+				cfg.WebUIPassword = pw
 				changed = true
 			}
 		}
-	}
-	if in.ProxyURL != nil && in.ProxyMode == nil {
-		cfg.ProxyURL = strings.TrimSpace(*in.ProxyURL)
-		lane.SetProxy(cfg.ProxyMode, cfg.ProxyURL)
-		changed = true
-	}
-	if in.FailoverEnabled != nil {
-		cfg.FailoverEnabled = *in.FailoverEnabled
-		s.Lane.SetFailover(cfg.FailoverEnabled, cfg.FailoverMax)
-		changed = true
-	}
-	if in.FailoverMax != nil && *in.FailoverMax > 0 && *in.FailoverMax <= 5 {
-		cfg.FailoverMax = *in.FailoverMax
-		s.Lane.SetFailover(cfg.FailoverEnabled, cfg.FailoverMax)
-		changed = true
-	}
-
-	// --- proxy pool ---
-	poolTouched := false
-	if in.ProxyPoolEnabled != nil && *in.ProxyPoolEnabled != cfg.ProxyPoolEnabled {
-		cfg.ProxyPoolEnabled = *in.ProxyPoolEnabled
-		changed, poolTouched = true, true
-	}
-	if in.ProxyPoolAutoRotate != nil {
-		cfg.ProxyPoolAutoRotate = *in.ProxyPoolAutoRotate
-		changed = true
-	}
-	if in.ProxyPoolSources != nil {
-		clean := []string{}
-		for _, s := range in.ProxyPoolSources {
-			if t := strings.TrimSpace(s); t != "" {
-				clean = append(clean, t)
+		if in.DefaultMaxTokens != nil && *in.DefaultMaxTokens > 0 {
+			cfg.DefaultMaxTokens = *in.DefaultMaxTokens
+			s.Lane.SetDefaultMaxTokens(*in.DefaultMaxTokens)
+			changed = true
+		}
+		if in.DefaultEffort != nil {
+			switch *in.DefaultEffort {
+			case "light", "balanced", "deep":
+				cfg.DefaultEffort = *in.DefaultEffort
+				changed = true
 			}
 		}
-		cfg.ProxyPoolSources = clean
-		changed, poolTouched = true, true
-	}
-	if in.ProxyPoolMaxTest != nil && *in.ProxyPoolMaxTest > 0 {
-		cfg.ProxyPoolMaxTest = *in.ProxyPoolMaxTest
-		changed, poolTouched = true, true
-	}
-	if in.ProxyPoolConcurrency != nil && *in.ProxyPoolConcurrency > 0 {
-		cfg.ProxyPoolConcurrency = *in.ProxyPoolConcurrency
-		changed, poolTouched = true, true
-	}
-	if in.ProxyPoolTimeoutSec != nil && *in.ProxyPoolTimeoutSec > 0 {
-		cfg.ProxyPoolTimeoutSec = *in.ProxyPoolTimeoutSec
-		changed, poolTouched = true, true
-	}
-	if in.ProxyPoolVerifyUpstream != nil {
-		cfg.ProxyPoolVerifyUpstream = *in.ProxyPoolVerifyUpstream
-		changed, poolTouched = true, true
-	}
-	if in.ProxyPoolMinUsable != nil && *in.ProxyPoolMinUsable > 0 {
-		cfg.ProxyPoolMinUsable = *in.ProxyPoolMinUsable
-		changed = true
-	}
-	// 0 is meaningful here: it turns the scheduled refresh off
-	if in.ProxyPoolRefreshMinutes != nil && *in.ProxyPoolRefreshMinutes >= 0 && *in.ProxyPoolRefreshMinutes <= 1440 {
-		cfg.ProxyPoolRefreshMinutes = *in.ProxyPoolRefreshMinutes
-		changed = true
-	}
-	// 0 is meaningful here too: it disables keyless access outright
-	if in.AnonymousRPM != nil && *in.AnonymousRPM >= 0 && *in.AnonymousRPM <= 100000 {
-		cfg.AnonymousRPM = *in.AnonymousRPM
-		changed = true
-	}
-	if s.pool != nil && poolTouched {
-		s.pool.Configure(cfg.ProxyPoolSources, cfg.ProxyPoolMaxTest, cfg.ProxyPoolConcurrency,
-			cfg.ProxyPoolTimeoutSec, cfg.ProxyPoolVerifyUpstream)
-	}
-	if s.pool != nil && in.ProxyPoolEnabled != nil {
-		// flipping the switch also swaps the transport's proxy mode
-		if cfg.ProxyPoolEnabled {
-			lane.SetProxy("pool", "")
-		} else {
-			lane.SetActiveProxy(nil)
-			lane.SetProxy(cfg.ProxyMode, cfg.ProxyURL)
+		if in.ProbeIntervalMinutes != nil && *in.ProbeIntervalMinutes > 0 {
+			cfg.ProbeIntervalMinutes = *in.ProbeIntervalMinutes
+			changed = true
 		}
-	}
-	if changed {
-		_ = s.Store.Save()
-		if s.logger != nil {
-			s.logger.Infof("设置已保存")
+		if in.ExposeRegion != nil {
+			cfg.ExposeRegion = *in.ExposeRegion
+			s.Lane.SetExposeRegion(*in.ExposeRegion)
+			changed = true
 		}
+		if in.ProxyMode != nil {
+			switch *in.ProxyMode {
+			case "env", "direct", "custom", "system":
+				if cfg.ProxyMode != *in.ProxyMode || (in.ProxyURL != nil && cfg.ProxyURL != *in.ProxyURL) {
+					cfg.ProxyMode = *in.ProxyMode
+					if in.ProxyURL != nil {
+						cfg.ProxyURL = strings.TrimSpace(*in.ProxyURL)
+					}
+					// While the pool is enabled it owns the transport
+					// ("pool" mode): applying the plain proxy mode here would
+					// silently pull the lane off the pool's egress.
+					if !cfg.ProxyPoolEnabled {
+						lane.SetProxy(cfg.ProxyMode, cfg.ProxyURL)
+					}
+					changed = true
+				}
+			}
+		}
+		if in.ProxyURL != nil && in.ProxyMode == nil {
+			cfg.ProxyURL = strings.TrimSpace(*in.ProxyURL)
+			if !cfg.ProxyPoolEnabled {
+				lane.SetProxy(cfg.ProxyMode, cfg.ProxyURL)
+			}
+			changed = true
+		}
+		if in.FailoverEnabled != nil {
+			cfg.FailoverEnabled = *in.FailoverEnabled
+			s.Lane.SetFailover(cfg.FailoverEnabled, cfg.FailoverMax)
+			changed = true
+		}
+		if in.FailoverMax != nil && *in.FailoverMax > 0 && *in.FailoverMax <= 5 {
+			cfg.FailoverMax = *in.FailoverMax
+			s.Lane.SetFailover(cfg.FailoverEnabled, cfg.FailoverMax)
+			changed = true
+		}
+
+		// --- proxy pool ---
+		poolTouched := false
+		if in.ProxyPoolEnabled != nil && *in.ProxyPoolEnabled != cfg.ProxyPoolEnabled {
+			cfg.ProxyPoolEnabled = *in.ProxyPoolEnabled
+			changed, poolTouched = true, true
+		}
+		if in.ProxyPoolAutoRotate != nil {
+			cfg.ProxyPoolAutoRotate = *in.ProxyPoolAutoRotate
+			changed = true
+		}
+		if in.ProxyPoolSources != nil {
+			clean := []string{}
+			for _, src := range in.ProxyPoolSources {
+				if t := strings.TrimSpace(src); t != "" {
+					clean = append(clean, t)
+				}
+			}
+			cfg.ProxyPoolSources = clean
+			changed, poolTouched = true, true
+		}
+		if in.ProxyPoolMaxTest != nil && *in.ProxyPoolMaxTest > 0 {
+			cfg.ProxyPoolMaxTest = *in.ProxyPoolMaxTest
+			changed, poolTouched = true, true
+		}
+		if in.ProxyPoolConcurrency != nil && *in.ProxyPoolConcurrency > 0 {
+			cfg.ProxyPoolConcurrency = *in.ProxyPoolConcurrency
+			changed, poolTouched = true, true
+		}
+		if in.ProxyPoolTimeoutSec != nil && *in.ProxyPoolTimeoutSec > 0 {
+			cfg.ProxyPoolTimeoutSec = *in.ProxyPoolTimeoutSec
+			changed, poolTouched = true, true
+		}
+		if in.ProxyPoolVerifyUpstream != nil {
+			cfg.ProxyPoolVerifyUpstream = *in.ProxyPoolVerifyUpstream
+			changed, poolTouched = true, true
+		}
+		if in.ProxyPoolMinUsable != nil && *in.ProxyPoolMinUsable > 0 {
+			cfg.ProxyPoolMinUsable = *in.ProxyPoolMinUsable
+			changed = true
+		}
+		// 0 is meaningful here: it turns the scheduled refresh off
+		if in.ProxyPoolRefreshMinutes != nil && *in.ProxyPoolRefreshMinutes >= 0 && *in.ProxyPoolRefreshMinutes <= 1440 {
+			cfg.ProxyPoolRefreshMinutes = *in.ProxyPoolRefreshMinutes
+			changed = true
+		}
+		// 0 is meaningful here too: it disables keyless access outright
+		if in.AnonymousRPM != nil && *in.AnonymousRPM >= 0 && *in.AnonymousRPM <= 100000 {
+			cfg.AnonymousRPM = *in.AnonymousRPM
+			changed = true
+		}
+		if s.pool != nil && poolTouched {
+			s.pool.Configure(cfg.ProxyPoolSources, cfg.ProxyPoolMaxTest, cfg.ProxyPoolConcurrency,
+				cfg.ProxyPoolTimeoutSec, cfg.ProxyPoolVerifyUpstream)
+		}
+		if s.pool != nil && in.ProxyPoolEnabled != nil {
+			// flipping the switch also swaps the transport's proxy mode
+			if cfg.ProxyPoolEnabled {
+				lane.SetProxy("pool", "")
+			} else {
+				lane.SetActiveProxy(nil)
+				lane.SetProxy(cfg.ProxyMode, cfg.ProxyURL)
+			}
+		}
+	})
+	if changed && s.logger != nil {
+		s.logger.Infof("设置已保存")
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "changed": changed, "restartNote": restartNote})
 }

@@ -207,10 +207,18 @@ func DetectEgress(ctx context.Context) Egress {
 	return DetectEgressVia(ctx, laneHTTP)
 }
 
+// egressAttemptTimeout caps one IP-echo attempt. The shared client carries no
+// overall timeout, so without this a hanging echo service blocks the probe
+// round forever (its "probing" flag never clears). It is a var so tests can
+// shrink it.
+var egressAttemptTimeout = 10 * time.Second
+
 // DetectEgressVia is DetectEgress through an explicit client (proxy testing).
 func DetectEgressVia(ctx context.Context, client *http.Client) Egress {
 	try := func(url string, parse func([]byte) Egress) (Egress, bool) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		tctx, cancel := context.WithTimeout(ctx, egressAttemptTimeout)
+		defer cancel()
+		req, err := http.NewRequestWithContext(tctx, http.MethodGet, url, nil)
 		if err != nil {
 			return Egress{}, false
 		}

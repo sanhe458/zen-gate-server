@@ -148,7 +148,7 @@ func do(t *testing.T, s *Server, req *http.Request) *httptest.ResponseRecorder {
 // key, unmetered with one, and a plain 401 for a wrong key.
 func TestGateAnonymousThenKeyed(t *testing.T) {
 	s := newTestServer(t)
-	s.Store.Config().AnonymousRPM = 3
+	s.Store.Update(func(c *store.Config) { c.AnonymousRPM = 3 })
 
 	anon := func() *httptest.ResponseRecorder {
 		r := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
@@ -192,7 +192,7 @@ func TestGateAnonymousThenKeyed(t *testing.T) {
 // TestKeylessAccessCanBeDisabled covers AnonymousRPM = 0.
 func TestKeylessAccessCanBeDisabled(t *testing.T) {
 	s := newTestServer(t)
-	s.Store.Config().AnonymousRPM = 0
+	s.Store.Update(func(c *store.Config) { c.AnonymousRPM = 0 })
 	r := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	r.RemoteAddr = "203.0.113.7:5555"
 	if w := do(t, s, r); w.Code != http.StatusUnauthorized {

@@ -29,8 +29,6 @@ type Decoder struct {
 	pidx map[float64]string
 	// responses-wire output_index → key
 	oidx map[float64]string
-	// chat-wire tool calls without index, grouped by id
-	chatTool map[string]int // provider id → block index
 }
 
 // StreamResult accumulates what one upstream call produced.
@@ -90,7 +88,6 @@ func NewDecoder(wire string, rename map[string]string, emit func(Chunk)) *Decode
 		toolArgs: map[int]string{},
 		pidx:     map[float64]string{},
 		oidx:     map[float64]string{},
-		chatTool: map[string]int{},
 	}
 }
 
@@ -247,20 +244,21 @@ func (d *Decoder) chatToolCall(m map[string]any) {
 		// continuation belongs to the previous block for that id.
 		if id != "" {
 			key = "tool:" + id
-		} else if len(d.chatTool) > 0 {
-			// no id and no index: attach to the last open tool block
+		} else {
+			// No id and no index: attach to the most recently opened tool
+			// block (highest block index). Map iteration order is random,
+			// so picking the first "tool:" key found would attach the
+			// fragment to a random block when several are open.
+			best, bestIdx := "", -1
 			for k, idx := range d.blocks {
-				if strings.HasPrefix(k, "tool:") {
-					_ = idx
-					key = k
-					break
+				if strings.HasPrefix(k, "tool:") && idx > bestIdx {
+					best, bestIdx = k, idx
 				}
 			}
-			if key == "" {
-				return
+			if best == "" {
+				return // no open tool block to attach to
 			}
-		} else {
-			return
+			key = best
 		}
 	}
 	name := ""
@@ -349,7 +347,13 @@ func (d *Decoder) decodeMessages(frame map[string]any) {
 			}
 		}
 	case "message_stop":
-		d.setFinish(FinishStop)
+		// Anthropic emits message_delta (carrying the real stop_reason)
+		// before message_stop. Only fill in a default when no reason was
+		// seen, or a max_tokens truncation would be overwritten by a
+		// generic "stop" and reported to the client as a clean finish.
+		if !d.result.SawFinish {
+			d.setFinish(FinishStop)
+		}
 	case "error":
 		// handled by readSSE
 	}

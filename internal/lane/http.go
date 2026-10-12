@@ -59,9 +59,38 @@ func ClassifyFailure(status int, payload string, retryAfterSec int) *UpstreamErr
 	return e
 }
 
-// laneHTTP is the shared client for all upstream traffic; zen-gate swaps its
-// Transport when the proxy setting changes (hot, no restart).
-var laneHTTP = &http.Client{}
+// laneTransport is the process-wide upstream transport. It is created once
+// and never swapped: its Proxy hook is fixed at init and consults the
+// current egress decider through an atomic pointer, so changing the proxy
+// setting is a pointer swap — no data race on the Transport field and no
+// dropped connection pool.
+var laneTransport = &http.Transport{
+	MaxIdleConns:          128,
+	MaxIdleConnsPerHost:   16,
+	IdleConnTimeout:       90 * time.Second,
+	TLSHandshakeTimeout:   10 * time.Second,
+	ExpectContinueTimeout: time.Second,
+}
+
+// proxyDecider selects the egress URL for one request; swapped atomically by
+// SetProxy. It starts on the environment, matching http.DefaultTransport's
+// behaviour before any explicit configuration.
+var proxyDecider atomic.Pointer[func(*http.Request) (*neturl.URL, error)]
+
+func init() {
+	env := http.ProxyFromEnvironment
+	proxyDecider.Store(&env)
+	laneTransport.Proxy = func(req *http.Request) (*neturl.URL, error) {
+		if f := proxyDecider.Load(); f != nil {
+			return (*f)(req)
+		}
+		return nil, nil
+	}
+}
+
+// laneHTTP is the shared client for all upstream traffic; it always rides
+// laneTransport, whose egress is re-pointed hot by SetProxy.
+var laneHTTP = &http.Client{Transport: laneTransport}
 
 // dynamicProxy is the proxy selected by the pool at runtime. In "pool" mode
 // the transport consults it on every request, so switching egress costs
@@ -80,26 +109,26 @@ func ActiveProxy() *neturl.URL { return dynamicProxy.Load() }
 // "system" follows the desktop system proxy, "direct" bypasses, "custom" uses
 // the given URL, "pool" defers to whatever the proxy pool selected.
 func SetProxy(mode, url string) {
-	t := &http.Transport{}
 	switch mode {
 	case "direct":
-		t.Proxy = nil
+		storeDecider(func(*http.Request) (*neturl.URL, error) { return nil, nil })
 	case "custom":
 		u, err := parseProxyURL(url)
 		if err != nil {
-			t.Proxy = http.ProxyFromEnvironment
+			storeDecider(http.ProxyFromEnvironment)
 		} else {
-			t.Proxy = func(*http.Request) (*neturl.URL, error) { return u, nil }
+			storeDecider(func(*http.Request) (*neturl.URL, error) { return u, nil })
 		}
 	case "system":
-		t.Proxy = func(*http.Request) (*neturl.URL, error) { return SystemProxyURL(), nil }
+		storeDecider(func(*http.Request) (*neturl.URL, error) { return SystemProxyURL(), nil })
 	case "pool":
-		t.Proxy = func(*http.Request) (*neturl.URL, error) { return dynamicProxy.Load(), nil }
+		storeDecider(func(*http.Request) (*neturl.URL, error) { return dynamicProxy.Load(), nil })
 	default:
-		t.Proxy = http.ProxyFromEnvironment
+		storeDecider(http.ProxyFromEnvironment)
 	}
-	laneHTTP.Transport = t
 }
+
+func storeDecider(f func(*http.Request) (*neturl.URL, error)) { proxyDecider.Store(&f) }
 
 // Client returns the shared upstream HTTP client (proxy-aware).
 func Client() *http.Client { return laneHTTP }
@@ -209,7 +238,7 @@ func GetJSON(ctx context.Context, path string, session, requestID string, out an
 	for k, v := range GatewayHeaders(session, requestID, false, "application/json") {
 		req.Header.Set(k, v)
 	}
-	client := &http.Client{Timeout: 15 * time.Second, Transport: laneHTTP.Transport}
+	client := &http.Client{Timeout: 15 * time.Second, Transport: laneTransport}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -556,10 +585,16 @@ func (u *Usage) Override(o *Usage) {
 	u.TotalTokens = u.Input + u.Output
 }
 
+// jsonString reads a JSON field as a string. A missing/null field is "" —
+// marshaling nil would yield the literal "null", which callers guarding on
+// "" (optional ids, names, argument fragments, deltas) would then leak
+// verbatim into the projected request or response.
 func jsonString(v any) string {
 	switch t := v.(type) {
 	case string:
 		return t
+	case nil:
+		return ""
 	default:
 		b, _ := json.Marshal(t)
 		return string(b)

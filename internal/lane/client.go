@@ -209,6 +209,15 @@ func (l *Lane) SetExposeRegion(b bool) {
 	l.mu.Unlock()
 }
 
+// ExposeRegion reports whether region-blocked models may appear in listings.
+// Read it instead of touching the field: SetExposeRegion writes it from the
+// admin settings handler while /v1 listings read it.
+func (l *Lane) ExposeRegion() bool {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.exposeRegion
+}
+
 // ProbingModel returns the id currently under probe ("" when idle).
 func (l *Lane) ProbingModel() string {
 	l.mu.RLock()
@@ -246,7 +255,7 @@ func (l *Lane) ServableModels() []ModelInfo {
 		case StateUnavailable:
 			continue
 		case StateRegionBlock:
-			if !l.exposeRegion {
+			if !l.ExposeRegion() {
 				continue
 			}
 		}

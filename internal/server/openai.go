@@ -608,6 +608,12 @@ func convertResponsesInput(raw json.RawMessage, instructions string) []lane.Mess
 			if role == "" {
 				role = "user"
 			}
+			// The Responses API speaks "developer" where the chat wire
+			// speaks "system"; ToChatMessages switches on the four
+			// canonical roles and would silently drop the turn otherwise.
+			if role == "developer" {
+				role = lane.RoleSystem
+			}
 			parts := responsesContentParts(it.Content)
 			out = append(out, lane.Message{Role: role, Parts: parts})
 		case "function_call":

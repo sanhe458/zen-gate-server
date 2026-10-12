@@ -54,23 +54,30 @@ func main() {
 	logger := logx.New(st.Home)
 	defer logger.Close()
 
-	cfg := st.Config()
+	// Command-line overrides go through the store's copy-on-write Update:
+	// Config() hands out a read-only snapshot, so writing the flag straight
+	// onto it would mutate a copy and Save() would persist nothing.
 	applied := []string{}
-	if *port > 0 {
-		cfg.Port = *port
-		_ = st.Save()
-		applied = append(applied, fmt.Sprintf("port=%d", *port))
+	if *port > 0 || *host != "" || *password != "" {
+		st.Update(func(c *store.Config) {
+			if *port > 0 {
+				c.Port = *port
+				applied = append(applied, fmt.Sprintf("port=%d", *port))
+			}
+			if h := strings.TrimSpace(*host); h != "" && h != c.ListenHost {
+				c.ListenHost = h
+				applied = append(applied, "host="+h)
+			}
+			if p := strings.TrimSpace(*password); p != "" && p != c.WebUIPassword {
+				c.WebUIPassword = p
+				applied = append(applied, "webui-password=set")
+			}
+		})
+		if len(applied) > 0 {
+			logger.Infof("已应用启动参数: %s", strings.Join(applied, ", "))
+		}
 	}
-	if *host != "" && *host != cfg.ListenHost {
-		cfg.ListenHost = strings.TrimSpace(*host)
-		_ = st.Save()
-		applied = append(applied, "host="+cfg.ListenHost)
-	}
-	if *password != "" && *password != cfg.WebUIPassword {
-		cfg.WebUIPassword = strings.TrimSpace(*password)
-		_ = st.Save()
-		applied = append(applied, "webui-password=set")
-	}
+	cfg := st.Config()
 	bindHost := cfg.ListenHost
 	if bindHost == "" {
 		bindHost = "127.0.0.1"

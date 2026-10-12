@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"zen-gate-server/internal/lane"
+	"zen-gate-server/internal/store"
 )
 
 // withFakeUpstream points the lane at a local stub so the HTTP handlers can be
@@ -63,7 +64,7 @@ func TestBaseURLNeverAdvertisesUnspecifiedBind(t *testing.T) {
 
 	// ListenAddr keeps describing where it actually listens
 	s.addr.Store("[::]:8787")
-	s.Store.Config().ListenHost = "0.0.0.0"
+	s.Store.Update(func(c *store.Config) { c.ListenHost = "0.0.0.0" })
 	if got := s.ListenAddr(); got != "0.0.0.0:8787" {
 		t.Errorf("ListenAddr = %q, want 0.0.0.0:8787", got)
 	}

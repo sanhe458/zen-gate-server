@@ -157,6 +157,17 @@ type Store struct {
 	perf      map[string][]int64 // per-model probe first-token samples (ms)
 	perfDirty bool
 	mu        sync.Mutex
+
+	// cfgMu guards the cfg pointer itself. The config is copy-on-write:
+	// Config() hands out an immutable snapshot that readers may use without
+	// holding any lock, and Update() swaps in a modified copy atomically.
+	// Without this, an admin save writing cfg.AgentKeys while /v1 traffic
+	// iterates the same map is a "concurrent map iteration and map write"
+	// fatal error — an unrecoverable process crash, not a warning.
+	cfgMu sync.RWMutex
+	// keyMu serialises the check-then-mint pattern of the key helpers so two
+	// concurrent calls cannot both mint for the same label.
+	keyMu sync.Mutex
 }
 
 const perfMaxSamples = 30
@@ -230,9 +241,19 @@ func Open() (*Store, error) {
 	}
 	s := &Store{Home: home}
 	cfg, err := loadJSON[Config](filepath.Join(home, "config.json"))
-	if err != nil || cfg.MainKey == "" {
+	if err != nil {
+		// unreadable or missing: seed defaults (a corrupt file is preserved
+		// next to it by loadJSON for forensics)
 		def := defaultConfig()
 		cfg = &def
+		if err := writeJSON(filepath.Join(home, "config.json"), cfg); err != nil {
+			return nil, err
+		}
+	} else if cfg.MainKey == "" {
+		// a valid config with an empty key only misses the key: mint one and
+		// keep every other setting. Replacing the whole config here would
+		// silently wipe the user's agent keys, share keys and pool setup.
+		cfg.MainKey = GenerateKey("")
 		if err := writeJSON(filepath.Join(home, "config.json"), cfg); err != nil {
 			return nil, err
 		}
@@ -366,7 +387,10 @@ func (s *Store) SetQuotaNote(model string, n QuotaNote) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cutoff := time.Now().Add(-quotaEpisodeTTL).UnixMilli()
-	kept := n.Episodes[:0]
+	// filter into a fresh slice: n.Episodes may share its backing array with
+	// the lane's live note, and in-place filtering would race with a
+	// concurrent append on the lane side.
+	kept := make([]QuotaEpisode, 0, len(n.Episodes))
 	for _, e := range n.Episodes {
 		if e.End == 0 || e.End >= cutoff {
 			kept = append(kept, e)
@@ -425,55 +449,117 @@ func GenerateShareKey() string {
 
 // CreateShareKey mints and stores a new shared key for one label.
 func (s *Store) CreateShareKey(label string) string {
-	s.mu.Lock()
-	if s.cfg.ShareKeys == nil {
-		s.cfg.ShareKeys = map[string]string{}
-	}
+	s.keyMu.Lock()
+	defer s.keyMu.Unlock()
 	k := GenerateShareKey()
-	s.cfg.ShareKeys[label] = k
-	s.mu.Unlock()
-	_ = s.Save()
+	s.Update(func(c *Config) {
+		if c.ShareKeys == nil {
+			c.ShareKeys = map[string]string{}
+		}
+		c.ShareKeys[label] = k
+	})
 	return k
 }
 
 // DeleteShareKey removes one shared key; it reports whether it existed.
 func (s *Store) DeleteShareKey(label string) bool {
-	s.mu.Lock()
+	s.keyMu.Lock()
+	defer s.keyMu.Unlock()
+	s.cfgMu.RLock()
 	_, ok := s.cfg.ShareKeys[label]
-	if ok {
-		delete(s.cfg.ShareKeys, label)
+	s.cfgMu.RUnlock()
+	if !ok {
+		return false
 	}
-	s.mu.Unlock()
-	if ok {
-		_ = s.Save()
-	}
-	return ok
+	s.Update(func(c *Config) { delete(c.ShareKeys, label) })
+	return true
 }
 
-// Config returns the live config (mutable via Save).
-func (s *Store) Config() *Config { return s.cfg }
+// clone returns a deep copy: every reference-typed field (the three maps and
+// the sources slice) is private, so the copy can be read — or accidentally
+// written — without touching the store or racing with concurrent readers.
+func (c *Config) clone() *Config {
+	cp := *c
+	cp.AgentKeys = cloneStrMap(c.AgentKeys)
+	cp.ShareKeys = cloneStrMap(c.ShareKeys)
+	cp.EnabledAgents = cloneBoolMap(c.EnabledAgents)
+	if c.ProxyPoolSources != nil {
+		cp.ProxyPoolSources = append([]string{}, c.ProxyPoolSources...)
+	}
+	return &cp
+}
+
+// Config returns an immutable snapshot of the configuration. Every field is
+// a private copy, so writing through the result affects nothing and races
+// with nobody — before the copy-on-write refactor this returned the live
+// pointer, and an admin save mutating cfg.AgentKeys while /v1 traffic
+// iterated the same map fatal-crashed the process (Go treats concurrent map
+// iteration + map write as uncatchable). All mutations go through Update.
+func (s *Store) Config() *Config {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return s.cfg.clone()
+}
+
+// Update applies fn to a private copy of the config and swaps it in
+// atomically, persisting the result. Readers see either the old or the new
+// config, never a half-applied one, and never race with the writer.
+func (s *Store) Update(fn func(*Config)) {
+	s.cfgMu.Lock()
+	cp := s.cfg.clone()
+	fn(cp)
+	s.cfg = cp
+	s.cfgMu.Unlock()
+	_ = s.Save()
+}
 
 // Save persists the config.
 func (s *Store) Save() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
 	return writeJSON(filepath.Join(s.Home, "config.json"), s.cfg)
 }
 
 // KeyForAgent returns (creating if needed) the stable subkey of one agent.
 func (s *Store) KeyForAgent(agentID string) string {
-	s.mu.Lock()
-	if k, ok := s.cfg.AgentKeys[agentID]; ok && k != "" {
-		s.mu.Unlock()
+	s.keyMu.Lock()
+	defer s.keyMu.Unlock()
+	s.cfgMu.RLock()
+	k, ok := s.cfg.AgentKeys[agentID]
+	s.cfgMu.RUnlock()
+	if ok && k != "" {
 		return k
 	}
-	k := GenerateKey(agentID)
-	s.cfg.AgentKeys[agentID] = k
-	s.mu.Unlock()
-	// Save takes s.mu itself, so it must never be called while it is held:
-	// sync.Mutex is not reentrant and the call would deadlock forever.
-	_ = s.Save()
+	k = GenerateKey(agentID)
+	s.Update(func(c *Config) {
+		if c.AgentKeys == nil {
+			c.AgentKeys = map[string]string{}
+		}
+		c.AgentKeys[agentID] = k
+	})
 	return k
+}
+
+func cloneStrMap(m map[string]string) map[string]string {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneBoolMap(m map[string]bool) map[string]bool {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]bool, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
 }
 
 // Record folds one call into the stats.

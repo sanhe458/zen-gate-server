@@ -77,7 +77,7 @@ func (b *ThrottleBook) Clear() {
 		}
 		n.ThrottledAt = 0
 		n.CooldownUntil = 0
-		changed[m] = *n
+		changed[m] = n.clone()
 	}
 	b.mu.Unlock()
 	for m, n := range changed { // fire outside the lock, matching MarkOK
@@ -92,6 +92,16 @@ func (b *ThrottleBook) noteLocked(model string) *ThrottleNote {
 		b.notes[model] = n
 	}
 	return n
+}
+
+// clone returns a deep copy of the note. Every value that leaves the book
+// (fire callbacks, Note, All) goes through it: a plain struct copy shares the
+// Episodes backing array, and the book mutates those elements in place
+// (closing open episodes, pruning) — readers outside the lock would race.
+func (n *ThrottleNote) clone() ThrottleNote {
+	cp := *n
+	cp.Episodes = append([]ThrottleEpisode(nil), n.Episodes...)
+	return cp
 }
 
 func (b *ThrottleBook) fire(model string, n ThrottleNote) {
@@ -119,7 +129,7 @@ func (b *ThrottleBook) MarkThrottled(model string, retryAfterSec int) {
 	}
 	n.CooldownUntil = now + cd
 	b.pruneLocked(n)
-	note := *n
+	note := n.clone()
 	b.mu.Unlock()
 	b.fire(model, note)
 }
@@ -146,7 +156,7 @@ func (b *ThrottleBook) MarkOK(model string) {
 		n.CooldownUntil = 0
 		b.pruneLocked(n)
 	}
-	note := *n
+	note := n.clone()
 	b.mu.Unlock()
 	if changed {
 		b.fire(model, note)
@@ -175,7 +185,7 @@ func (b *ThrottleBook) Note(model string) ThrottleNote {
 		return ThrottleNote{}
 	}
 	b.expireLocked(n)
-	return *n
+	return n.clone()
 }
 
 // All snapshots every note with expiry applied.
@@ -185,7 +195,7 @@ func (b *ThrottleBook) All() map[string]ThrottleNote {
 	out := map[string]ThrottleNote{}
 	for m, n := range b.notes {
 		b.expireLocked(n)
-		out[m] = *n
+		out[m] = n.clone()
 	}
 	return out
 }
@@ -232,7 +242,7 @@ func (b *ThrottleBook) expireLocked(n *ThrottleNote) {
 
 func (b *ThrottleBook) pruneLocked(n *ThrottleNote) {
 	cutoff := time.Now().UnixMilli() - throttleEpisodeTTL
-	kept := n.Episodes[:0]
+	kept := make([]ThrottleEpisode, 0, len(n.Episodes))
 	for _, e := range n.Episodes {
 		if e.End == 0 || e.End >= cutoff {
 			kept = append(kept, e)

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -49,18 +50,34 @@ func base62From(b []byte) string {
 var lastStamp atomic.Int64
 var seqCounter atomic.Int64
 
+// mintMu guards nextSeq's check-reset-increment critical section. See nextSeq
+// for why a plain CAS loop is not enough.
+var mintMu sync.Mutex
+
+// nextSeq hands out the per-millisecond sequence number. The stamp check, the
+// counter reset and the increment are one atomic step under mintMu: without
+// it two goroutines landing in the same millisecond can both observe the old
+// stamp — one wins the swap, but the other's Add can still land before the
+// winner's reset, or a loser's unconditional reset can wipe a counter already
+// handed out — minting duplicate session ids for concurrent calls.
+// Extracted from MintSessionId so the critical section is directly testable.
+func nextSeq(nowMS int64) int64 {
+	mintMu.Lock()
+	defer mintMu.Unlock()
+	if lastStamp.Load() != nowMS {
+		lastStamp.Store(nowMS)
+		seqCounter.Store(0)
+	}
+	return seqCounter.Add(1)
+}
+
 // MintSessionId mints a gateway-shaped canonical session id
 // (time-prefixed, monotonic counter), matching upstream.js byte for byte.
 func MintSessionId(nowMS int64) string {
 	if nowMS <= 0 {
 		nowMS = time.Now().UnixMilli()
 	}
-	prev := lastStamp.Load()
-	if prev != nowMS {
-		lastStamp.CompareAndSwap(prev, nowMS)
-		seqCounter.Store(0)
-	}
-	seq := seqCounter.Add(1)
+	seq := nextSeq(nowMS)
 	value := ^(uint64(nowMS)<<12 | uint64(seq&0xFFF))
 	var raw [6]byte
 	for i := 0; i < 6; i++ {
