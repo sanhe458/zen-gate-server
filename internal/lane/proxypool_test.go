@@ -366,6 +366,41 @@ func TestParseProxyBodyIPPortObjects(t *testing.T) {
 	}
 }
 
+// TestParseProxyBodyGeonodeProtocols pins the geonode shape: one object per
+// proxy with a protocols array. Each protocol must become its own
+// scheme-prefixed candidate — a bare "ip:port" would inherit the source's
+// default scheme and mislabel every socks entry in the mixed list.
+func TestParseProxyBodyGeonodeProtocols(t *testing.T) {
+	body := []byte(`{"data":[
+		{"ip":"1.2.3.4","port":"7891","protocols":["socks5"],"country":"CN"},
+		{"ip":"5.6.7.8","port":3128,"protocols":["http","https"],"country":"US"},
+		{"ip":"9.9.9.9","port":1080,"protocols":[]}
+	],"total":3}`)
+	got := parseProxyBody(body)
+	// an entry with no protocols falls back to the bare "ip:port" shape and
+	// inherits the source's default scheme at normalizeProxy time
+	want := []string{"socks5://1.2.3.4:7891", "http://5.6.7.8:3128", "https://5.6.7.8:3128", "9.9.9.9:1080"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("got[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	// every emitted candidate must survive normalizeProxy with the right scheme
+	for _, raw := range got {
+		url, _, scheme, ok := normalizeProxy(raw, "http")
+		if !ok {
+			t.Errorf("normalizeProxy(%q) rejected", raw)
+			continue
+		}
+		if !strings.HasPrefix(url, scheme+"://") {
+			t.Errorf("normalizeProxy(%q) = %q scheme %q", raw, url, scheme)
+		}
+	}
+}
+
 // TestSchemeForSource guards against reading the listing's own https:// scheme
 // as the proxy protocol — that would mislabel every HTTPS-hosted list.
 func TestSchemeForSource(t *testing.T) {

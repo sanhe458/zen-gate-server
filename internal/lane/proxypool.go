@@ -48,6 +48,11 @@ var DefaultProxySources = []string{
 	"https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
 	"https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt",
 	"https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+	// geonode.com（每分钟更新的聚合池，~9k 在线）。API 返回 JSON 对象数组，
+	// 每项自带 protocols 字段，extractProxyStrings 按真实协议逐个生成候选，
+	// 所以这里不需要按协议拆分请求。limit 上限 500，拉两页。
+	"https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc",
+	"https://proxylist.geonode.com/api/proxy-list?limit=500&page=2&sort_by=lastChecked&sort_type=desc",
 }
 
 // ProxyEntry is one candidate egress.
@@ -928,6 +933,19 @@ func extractProxyStrings(v any, out *[]string) {
 				port = pv
 			}
 			if port != "" {
+				// geonode-style entries carry a protocols array ("http"/"https"/
+				// "socks4"/"socks5") instead of one endpoint per protocol. Emit
+				// each protocol as its own scheme-prefixed candidate: a bare
+				// "ip:port" would inherit the source's default scheme and
+				// mislabel every socks entry in a mixed list.
+				if protos, ok := t["protocols"].([]any); ok && len(protos) > 0 {
+					for _, pv := range protos {
+						if p, ok := pv.(string); ok && p != "" {
+							*out = append(*out, p+"://"+ip+":"+port)
+						}
+					}
+					return
+				}
 				*out = append(*out, ip+":"+port)
 				return
 			}
@@ -1068,7 +1086,14 @@ func fetchOneSource(ctx context.Context, client *http.Client, src string) ([]pro
 				continue
 			}
 			seen[addr] = true
-			out = append(out, proxyCandidate{Raw: addr, Scheme: defScheme, Country: note})
+			// a scheme-prefixed candidate (geonode's protocols array emits
+			// "socks5://ip:port") already knows its protocol — only bare
+			// "ip:port" lines fall back to the source's default scheme
+			scheme := defScheme
+			if i := strings.Index(addr, "://"); i > 0 {
+				scheme = addr[:i]
+			}
+			out = append(out, proxyCandidate{Raw: addr, Scheme: scheme, Country: note})
 		}
 		if i+1 < repeat {
 			select { // be a good citizen between polls
