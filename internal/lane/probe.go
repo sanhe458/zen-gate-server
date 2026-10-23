@@ -34,10 +34,10 @@ type ProbeResult struct {
 // answer. Only a gateway refusal that names the model counts against it:
 // 5xx, quota and transport faults stay "unknown" and never remove a model
 // from a picker.
-func ProbeModel(ctx context.Context, m ModelInfo) ProbeResult {
+func (l *Lane) ProbeModel(ctx context.Context, m ModelInfo) ProbeResult {
 	res := ProbeResult{Model: m.ID, State: StateUnknown, At: time.Now().UnixMilli()}
 	if m.Wire == "systemone" || IsSystemOneModel(m.ID) {
-		return probeSystemOne(ctx, m, res)
+		return l.probeSystemOne(ctx, m, res)
 	}
 	body := map[string]any{"model": m.ID, "stream": true, "max_tokens": 16}
 	var wire string
@@ -58,7 +58,7 @@ func ProbeModel(ctx context.Context, m ModelInfo) ProbeResult {
 	ApplyFingerprint(body, wire)
 
 	start := time.Now()
-	session := SessionForConversation("probe:" + m.ID)
+	session := l.SessionForConversation("probe:" + m.ID)
 	firstAt := int64(0)
 	var lastPayload atomic.Value
 	_, err := PostStreamed(ctx, EndpointFor(m.ID), body, session, MintRequestId(0), func(p []byte) error {
@@ -127,7 +127,7 @@ func inBandRefusal(payload string) (state, detail string) {
 // probeSystemOne pings a decision model on its own wire: a typed question
 // with a one-word state — no stream, no tools, no chat fields. A 200 with an
 // answers object is the same "alive" signal a chat ping is for chat wires.
-func probeSystemOne(ctx context.Context, m ModelInfo, res ProbeResult) ProbeResult {
+func (l *Lane) probeSystemOne(ctx context.Context, m ModelInfo, res ProbeResult) ProbeResult {
 	body := map[string]any{
 		"model": m.ID,
 		"state": "probe ping",
@@ -139,7 +139,7 @@ func probeSystemOne(ctx context.Context, m ModelInfo, res ProbeResult) ProbeResu
 		},
 	}
 	start := time.Now()
-	session := SessionForConversation("probe:" + m.ID)
+	session := l.SessionForConversation("probe:" + m.ID)
 	sawAnswers := false
 	_, err := PostStreamed(ctx, EndpointFor(m.ID), body, session, MintRequestId(0), func(p []byte) error {
 		var frame map[string]any
@@ -183,13 +183,13 @@ func probeSystemOne(ctx context.Context, m ModelInfo, res ProbeResult) ProbeResu
 
 // ProbeCatalog probes models strictly one at a time (the free lane and its
 // dashboard both prefer sequential, progressive results over parallel bursts).
-func ProbeCatalog(ctx context.Context, models []ModelInfo, onResult func(ProbeResult)) {
+func (l *Lane) ProbeCatalog(ctx context.Context, models []ModelInfo, onResult func(ProbeResult)) {
 	for _, m := range models {
 		if ctx.Err() != nil {
 			return
 		}
 		if onResult != nil {
-			onResult(ProbeModel(ctx, m))
+			onResult(l.ProbeModel(ctx, m))
 		}
 	}
 }

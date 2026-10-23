@@ -2,6 +2,7 @@ package lane
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -74,6 +75,13 @@ type Lane struct {
 	nextProbeAfter  time.Time
 	quotaWallActive bool
 	probingModel    string
+	// sessionEpoch bumps on every egress switch (ClearThrottle). It is mixed
+	// into the session-id derivation so a conversation stops landing on the
+	// upstream session that just burned out: the free lane accounts quota per
+	// session as well as per IP, so an IP hop alone still carries the old
+	// account. Between switches the epoch is constant and the same
+	// conversation keeps the same session id, as designed.
+	sessionEpoch atomic.Int64
 
 	// OnCall receives one record per physical upstream request.
 	OnCall func(CallRecord)
@@ -182,6 +190,7 @@ func (l *Lane) fireChange() {
 // the old connection say nothing about the new one. Models fall back to
 // "unknown" and the next probe round re-verifies them.
 func (l *Lane) ClearThrottle() {
+	l.sessionEpoch.Add(1) // new egress ⇒ new session identity, not just a new IP
 	l.throttle.Clear()
 	l.mu.Lock()
 	for id, r := range l.availability {
@@ -195,6 +204,19 @@ func (l *Lane) ClearThrottle() {
 	l.nextProbeAfter = time.Time{}
 	l.mu.Unlock()
 	l.fireChange()
+}
+
+// SessionForConversation derives the upstream session id for one turn, mixing
+// in the session epoch. Between egress switches the epoch is constant and the
+// same conversation keeps the same session id (quota is per session upstream,
+// so needless new ids would burn it); after a switch the epoch jumps, so
+// requests stop landing on the session whose quota just died — a new IP alone
+// still carries the old session's account.
+func (l *Lane) SessionForConversation(seed string) string {
+	if e := l.sessionEpoch.Load(); e > 0 {
+		seed = seed + "\x00epoch:" + strconv.FormatInt(e, 10)
+	}
+	return SessionForConversation(seed)
 }
 
 // ThrottleNotes snapshots the ledger for /state.
@@ -292,7 +314,7 @@ func (l *Lane) ServableModels() []ModelInfo {
 
 // RefreshCatalog re-pulls the listing; a failure keeps the cached catalog.
 func (l *Lane) RefreshCatalog(ctx context.Context) {
-	ids, err := FetchListing(ctx)
+	ids, err := l.FetchListing(ctx)
 	if err != nil || len(ids) == 0 {
 		return
 	}
@@ -333,7 +355,7 @@ func (l *Lane) ProbeRound(ctx context.Context, manual bool) {
 		l.mu.Unlock()
 		l.notify()
 
-		r := ProbeModel(ctx, m)
+		r := l.ProbeModel(ctx, m)
 
 		l.mu.Lock()
 		if l.OnProbeEdge != nil {
@@ -405,7 +427,7 @@ func (l *Lane) ProbeOne(model string) ProbeResult {
 		return ProbeResult{Model: model, State: StateUnknown, At: time.Now().UnixMilli()}
 	}
 
-	r := ProbeModel(context.Background(), entry)
+	r := l.ProbeModel(context.Background(), entry)
 
 	l.mu.Lock()
 	if prev, ok := l.availability[model]; ok && l.OnProbeEdge != nil && prev.State != r.State && prev.State != "" && r.State != "" {
@@ -687,7 +709,7 @@ func (l *Lane) attemptModel(ctx context.Context, req Request, model, effort stri
 		return body
 	}
 
-	session := SessionForConversation(req.SessionSeed)
+	session := l.SessionForConversation(req.SessionSeed)
 	requestID := RequestIdFor(session, req.TurnSeed)
 
 	body := buildBody(messages, req.Tools, budget)

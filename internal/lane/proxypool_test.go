@@ -179,6 +179,35 @@ func TestQuotaRotateFalseSurfacesError(t *testing.T) {
 	}
 }
 
+// TestSessionEpochChangesAfterClearThrottle pins the session-identity half of
+// the rotation: quota is accounted per session as well as per IP, so a switch
+// must move conversations onto a fresh session id — but keep it stable again
+// until the next switch, because needless new ids burn quota.
+func TestSessionEpochChangesAfterClearThrottle(t *testing.T) {
+	l := NewLane()
+	seed := "agent\x00user\x00hello"
+
+	before := l.SessionForConversation(seed)
+	if before != SessionForConversation(seed) {
+		t.Fatalf("epoch 0 must derive the same id as the plain derivation: %q vs %q", before, SessionForConversation(seed))
+	}
+
+	l.ClearThrottle()
+	after := l.SessionForConversation(seed)
+	if after == before {
+		t.Fatal("session id must change after ClearThrottle bumps the epoch")
+	}
+	if again := l.SessionForConversation(seed); again != after {
+		t.Fatal("session id must stay stable between switches")
+	}
+	// the minted id must still satisfy the 2026-10 gate (low 12 bits >= 0xfc0)
+	if _, ok := mintedSeqOf(after, 0); !ok {
+		if !strings.HasPrefix(after, "ses_") {
+			t.Fatalf("id %q lost the ses_ shape", after)
+		}
+	}
+}
+
 // TestClearThrottleResetsVerdicts covers the post-rotation reset: quota is per
 // IP, so verdicts recorded on the old egress must not survive the switch.
 func TestClearThrottleResetsVerdicts(t *testing.T) {
