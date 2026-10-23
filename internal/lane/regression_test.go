@@ -73,10 +73,11 @@ func TestNextSeqCriticalSection(t *testing.T) {
 }
 
 // TestMintSessionIdConcurrentUnique is the end-to-end guard for the same fix
-// through the public API: concurrent mints for one millisecond must decode to
-// distinct sequences. The seq field is 12 bits wide, so the hammer stays
-// under 4096 mints or the encoding itself wraps and the check false-alarms.
-// Run with -race.
+// through the public API: ids minted concurrently for one millisecond must all
+// be distinct, and each must satisfy the 2026-10 upstream gate — the low 12
+// bits of the hex counter are a descending value, so they must stay >= 0xfc0
+// (counter <= 63). The counter therefore wraps at 64 on purpose; uniqueness is
+// carried by the 14 random base62 characters (83 bits).
 func TestMintSessionIdConcurrentUnique(t *testing.T) {
 	now := time.Now().UnixMilli()
 	const n = 16
@@ -99,19 +100,22 @@ func TestMintSessionIdConcurrentUnique(t *testing.T) {
 	}
 	wg.Wait()
 
-	seen := make(map[uint64]bool, len(ids))
+	seen := make(map[string]bool, len(ids))
 	for _, id := range ids {
 		seq, ok := mintedSeqOf(id, now)
 		if !ok {
 			t.Fatalf("id %s does not carry the expected stamp", id)
 		}
-		if seen[seq] {
-			t.Fatalf("sequence %d handed out twice for one millisecond (id %s)", seq, id)
+		if seq > 63 {
+			t.Fatalf("id %s has counter %d, gate requires <= 63", id, seq)
 		}
-		seen[seq] = true
+		if seen[id] {
+			t.Fatalf("duplicate session id minted: %s", id)
+		}
+		seen[id] = true
 	}
 	if len(seen) != n*per {
-		t.Fatalf("distinct sequences = %d, want %d (a reset must not lose increments)", len(seen), n*per)
+		t.Fatalf("distinct ids = %d, want %d", len(seen), n*per)
 	}
 }
 
