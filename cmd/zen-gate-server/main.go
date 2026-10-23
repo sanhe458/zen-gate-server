@@ -166,6 +166,37 @@ func main() {
 		rotate("请求额度不足", true)
 	}
 
+	// 同步轮换：额度拒绝即将返回给调用方时，先换一次出口并原地重试同一轮——
+	// 调用方拿到的是正常响应而不是 429。池子真没地方去了才返回 false 放行错误。
+	var quotaRotating atomic.Bool
+	ln.OnQuotaRotate = func(model string) bool {
+		c := st.Config()
+		if !c.ProxyPoolEnabled || !c.ProxyPoolAutoRotate {
+			return false
+		}
+		// 折叠并发请求的重复轮换：同一时刻只有一个在换出口，其余直接复用
+		// 刚换好的新出口重试。
+		if !quotaRotating.CompareAndSwap(false, true) {
+			cur := pool.Current()
+			return cur != "" // 别人正在换：换成了就重试
+		}
+		defer quotaRotating.Store(false)
+		old := pool.Current()
+		url, err := pool.Rotate(ctx, true)
+		if err != nil {
+			logger.Warnf("同步出口切换失败（%s）：%v", model, err)
+			return false
+		}
+		from := old
+		if from == "" {
+			from = "本机直连"
+		}
+		logger.Infof("因请求额度不足，同步切换出口 %s → %s 后原地重试", from, url)
+		ln.ClearThrottle() // 新 IP 不欠旧账，旧出口的限额判定全部作废
+		go ln.ProbeRound(ctx, true)
+		return true
+	}
+
 	// live egress failure: the request never reached upstream, which in pool
 	// mode usually means the proxy stopped forwarding mid-flight. Verify before
 	// rotating — an upstream blip must not cost a switch — and collapse a burst

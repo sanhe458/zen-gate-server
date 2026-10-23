@@ -90,6 +90,13 @@ type Lane struct {
 	// lane accounts quota per IP, so a fresh IP restores service.
 	// model is the id that was refused, retryAfter the upstream hint (sec).
 	OnQuotaExhausted func(model string, retryAfter int)
+	// OnQuotaRotate is called synchronously when a quota refusal is about to
+	// surface to the caller. Returning true means the egress just changed (or
+	// changed moments ago), so the same turn is retried in place instead of
+	// returning an error — the refusal never leaves the gateway while the
+	// pool has anywhere to go. It must be cheap and non-blocking for long:
+	// one rotation, not a refresh.
+	OnQuotaRotate func(model string) bool
 	// OnEgressFailure fires when a live request never reached upstream — the
 	// transport/proxy path is broken. The proxy pool listens here to verify the
 	// current egress and rotate away from a proxy that stopped forwarding.
@@ -498,6 +505,7 @@ func (l *Lane) Complete(ctx context.Context, req Request, emit func(Chunk)) (Out
 
 	model := requested
 	failovers := 0
+	quotaRetries := 0
 	tried := map[string]bool{requested: true}
 	for {
 		// Tell the caller which model this attempt will use, before any byte
@@ -518,6 +526,18 @@ func (l *Lane) Complete(ctx context.Context, req Request, emit func(Chunk)) (Out
 		if uerr.Code == CodeQuota {
 			if hook := l.OnQuotaExhausted; hook != nil {
 				go hook(model, uerr.RetryAfter)
+			}
+			// The free lane accounts quota per IP, so one synchronous egress
+			// switch and an in-place retry of the same turn answers the caller
+			// instead of erroring out — as long as the pool actually moved and
+			// nothing was streamed yet. Runs before model failover: a fresh IP
+			// un-throttles the requested model itself.
+			if !sawAny && quotaRetries < 2 && l.OnQuotaRotate != nil && l.OnQuotaRotate(model) {
+				quotaRetries++
+				failovers = 0
+				tried = map[string]bool{requested: true}
+				model = requested
+				continue
 			}
 		}
 		// connection-level failure: the egress may have died mid-flight

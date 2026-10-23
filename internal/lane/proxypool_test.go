@@ -96,6 +96,89 @@ func TestQuotaHookSilentOnSuccess(t *testing.T) {
 	}
 }
 
+// TestQuotaRotateRetriesInPlace pins the no-error-on-quota behavior: when the
+// synchronous rotate hook reports a fresh egress, the same turn is retried in
+// place and the caller gets a normal response instead of the 429.
+func TestQuotaRotateRetriesInPlace(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("content-type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"message":"FreeUsageLimitError: usage limit reached for this ip"}}`))
+			return
+		}
+		w.Header().Set("content-type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n"))
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"index\":0,\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+	old := UpstreamBase
+	UpstreamBase = srv.URL
+	defer func() { UpstreamBase = old }()
+
+	l := NewLane()
+	var rotates atomic.Int32
+	l.OnQuotaRotate = func(string) bool {
+		rotates.Add(1)
+		return true // egress just moved: retry the same turn
+	}
+
+	var text string
+	out, uerr := l.Complete(context.Background(), Request{
+		Model:    "mimo-v2.6-flash-free",
+		Messages: []Message{{Role: RoleUser, Parts: []Part{TextPart{Text: "hi"}}}},
+	}, func(c Chunk) { text += c.Text + c.Delta })
+	if uerr != nil {
+		t.Fatalf("quota refusal must be answered by an in-place retry, got: %s (%s)", uerr.Code, uerr.Message)
+	}
+	if text != "ok" {
+		t.Errorf("streamed text = %q, want the retried answer", text)
+	}
+	if out.Finish != "stop" {
+		t.Errorf("finish = %q, want stop", out.Finish)
+	}
+	if rotates.Load() != 1 {
+		t.Errorf("rotate hook fired %d times, want exactly one", rotates.Load())
+	}
+	if calls.Load() != 2 {
+		t.Errorf("upstream saw %d requests, want 1 refused + 1 retry", calls.Load())
+	}
+}
+
+// TestQuotaRotateFalseSurfacesError keeps the honest path: when the pool has
+// nowhere to go (hook returns false) the refusal must still reach the caller.
+func TestQuotaRotateFalseSurfacesError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"FreeUsageLimitError: usage limit reached for this ip"}}`))
+	}))
+	defer srv.Close()
+	old := UpstreamBase
+	UpstreamBase = srv.URL
+	defer func() { UpstreamBase = old }()
+
+	l := NewLane()
+	var rotates atomic.Int32
+	l.OnQuotaRotate = func(string) bool {
+		rotates.Add(1)
+		return false // pool dry: nothing to rotate to
+	}
+
+	_, uerr := l.Complete(context.Background(), Request{
+		Model:    "mimo-v2.6-flash-free",
+		Messages: []Message{{Role: RoleUser, Parts: []Part{TextPart{Text: "hi"}}}},
+	}, func(Chunk) {})
+	if uerr == nil || uerr.Code != CodeQuota {
+		t.Fatalf("expected the quota error to surface, got %+v", uerr)
+	}
+	if rotates.Load() != 3 { // every refused attempt asks the pool once: 1 + failoverMax
+		t.Errorf("rotate hook fired %d times, want 3 (1 + failoverMax)", rotates.Load())
+	}
+}
+
 // TestClearThrottleResetsVerdicts covers the post-rotation reset: quota is per
 // IP, so verdicts recorded on the old egress must not survive the switch.
 func TestClearThrottleResetsVerdicts(t *testing.T) {
